@@ -253,8 +253,11 @@ async def register_in_yclients(name: str, phone: str, telegram_id: int) -> tuple
             if response.status_code == 201:
                 logger.info(f"Клиент успешно зарегистрирован в YCLIENTS: id={data['data']['id']}")
                 return True, data['data']['id']
-            elif response.status_code == 422 and "already exists" in str(data).lower():
-                logger.info(f"Клиент уже существует, ищем по телефону: {phone}")
+            elif response.status_code == 422:
+                # YCLIENTS возвращает 422 в т.ч. когда клиент с этим телефоном уже есть.
+                # Текст ошибки может быть на русском, поэтому не матчим конкретную
+                # строку — просто пробуем найти клиента по телефону.
+                logger.info(f"Регистрация вернула 422 ({data}), ищем клиента по телефону: {phone}")
                 search_url = f"https://api.yclients.com/api/v1/clients/{YCLIENTS_COMPANY_ID}"
                 search_resp = await client.get(search_url, headers=headers, params={"phone": phone})
                 search_data = search_resp.json()
@@ -961,6 +964,17 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def invalid_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Фолбэк для ввода, не подошедшего под текущий шаг диалога.
+    Ничего не возвращает — ConversationHandler оставляет состояние без изменений."""
+    if update.callback_query:
+        await update.callback_query.answer("Эта кнопка уже неактуальна 🤔", show_alert=True)
+    elif update.effective_message:
+        await update.effective_message.reply_text(
+            "Не понял 🤔 Пожалуйста, используйте кнопки или следуйте подсказке выше."
+        )
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Глобальный обработчик ошибок — не даёт боту падать на некритичных ошибках Telegram API"""
     if isinstance(context.error, BadRequest) and "Message is not modified" in str(context.error):
@@ -984,7 +998,10 @@ def main() -> None:
             PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_phone)],
             CONFIRM: [MessageHandler(filters.Regex(r"^(✅ Всё верно|❌ Изменить)$"), confirm)]
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        # CommandHandler'ы на /start и /cancel сюда не добавляем: команды всегда
+        # перехватываются в group=0 (force_start/force_cancel) и дальше не идут,
+        # так что такие fallback'и были бы мёртвым кодом.
+        fallbacks=[MessageHandler(filters.ALL, invalid_input)],
     )
     # Хэндлер бронирования
     book_handler = ConversationHandler(
@@ -1003,7 +1020,9 @@ def main() -> None:
             BOOK_DATE: [CallbackQueryHandler(book_date, pattern="^date_|back_procedures|back_date|book_cancel")],
             BOOK_TIME: [CallbackQueryHandler(book_time, pattern="^time_|back_date|book_cancel")],
         },
-        fallbacks=[CommandHandler("cancel", cancel), CommandHandler("start", start)],
+        # CommandHandler'ы на /start и /cancel сюда не добавляем по той же причине,
+        # что и в reg_handler — group=0 их перехватывает раньше.
+        fallbacks=[MessageHandler(filters.ALL, invalid_input), CallbackQueryHandler(invalid_input)],
     )
 
     # Храним в обычной переменной модуля, а НЕ в bot_data:
