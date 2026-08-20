@@ -7,8 +7,16 @@ import sys
 import httpx
 from collections import Counter
 from datetime import datetime, timedelta
+from pathlib import Path
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -62,6 +70,11 @@ PROCEDURES_CATEGORY_ID = int(os.getenv("PROCEDURES_CATEGORY_ID", "26014494"))
 # Насколько доверяем закэшированному прайсу. Цены меняются редко, а дёргать
 # API на каждом шаге брони незачем.
 SERVICES_CACHE_MINUTES = 10
+
+# Папка с фотографиями банного меню. Файлы отправляются альбомом перед выбором
+# процедур, порядок — по имени файла (1.jpg, 2.jpg, 3.jpg). Пусто или папки
+# нет — шаг молча пропускается.
+MENU_PHOTOS_DIR = Path(__file__).with_name("menu")
 
 # Файл для сохранения состояния диалогов между перезапусками бота
 PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "bot_persistence.pickle")
@@ -1013,6 +1026,7 @@ async def guest_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if context.user_data['with_procedures']:
         procedures = await get_procedures()
         if procedures:
+            await send_menu_photos(update, context)
             text, markup = procedures_screen(procedures, [], count, booking_header(context))
             await update.message.reply_text(text, reply_markup=markup)
             return PICK_PROCEDURES
@@ -1079,6 +1093,43 @@ async def contact_manager_callback(update: Update, context: ContextTypes.DEFAULT
         return ConversationHandler.END
 
 
+async def send_menu_photos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Отправляет альбом с фотографиями банного меню.
+
+    Первый раз файлы уходят с диска, дальше — по file_id, который Telegram
+    выдал на загрузку: так альбом не перезаливается каждому гостю заново.
+    file_id живут в bot_data и переживают перезапуск вместе с персистентностью.
+
+    Ошибки только логируются: не отправились фото — бронь всё равно продолжится.
+    """
+    cached = context.bot_data.get("menu_file_ids")
+
+    try:
+        if cached:
+            media = [InputMediaPhoto(file_id) for file_id in cached]
+        else:
+            files = sorted(
+                path for path in MENU_PHOTOS_DIR.glob("*")
+                if path.suffix.lower() in (".jpg", ".jpeg", ".png")
+            ) if MENU_PHOTOS_DIR.is_dir() else []
+            if not files:
+                logger.info(f"Фото меню не найдены в {MENU_PHOTOS_DIR}, пропускаем")
+                return
+            media = [InputMediaPhoto(path.read_bytes()) for path in files[:10]]
+
+        media[0] = InputMediaPhoto(media[0].media, caption="🧖 Банное меню")
+        messages = await update.effective_message.reply_media_group(media=media)
+
+        if not cached:
+            context.bot_data["menu_file_ids"] = [m.photo[-1].file_id for m in messages]
+            logger.info(f"Фото меню загружены и закэшированы: {len(messages)} шт.")
+    except Exception as e:
+        # Битый file_id после смены бота — сбрасываем кэш, в следующий раз зальём заново
+        context.bot_data.pop("menu_file_ids", None)
+        logger.error(f"Не удалось отправить фото меню: {e}")
+
+
 def procedures_screen(procedures: list, chosen: list, needed: int, header: str) -> tuple:
     """
     Готовит текст и клавиатуру выбора процедур.
@@ -1106,10 +1157,10 @@ def procedures_screen(procedures: list, chosen: list, needed: int, header: str) 
 
     keyboard = []
     if len(chosen) < needed:
+        # Только название: цены и длительность гость уже видел на фото меню
         for procedure in procedures:
             keyboard.append([InlineKeyboardButton(
-                f"{procedure['title']} — {money(procedure['price'])}",
-                callback_data=f"pick_{procedure['id']}"
+                procedure['title'], callback_data=f"pick_{procedure['id']}"
             )])
     if chosen:
         keyboard.append([InlineKeyboardButton("↩️ Убрать последнюю", callback_data="pick_undo")])
