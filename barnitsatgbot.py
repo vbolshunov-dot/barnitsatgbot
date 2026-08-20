@@ -70,6 +70,14 @@ def check_config() -> None:
         "PINE_WEEKEND_NO_PROC_SERVICE_ID": SERVICE_IDS["pine"]["weekend"]["no_proc"],
         "PINE_WEEKEND_WITH_PROC_SERVICE_ID": SERVICE_IDS["pine"]["weekend"]["with_proc"],
     }
+    if not YCLIENTS_USER_TOKEN:
+        print(
+            "ВНИМАНИЕ: не задан YCLIENTS_USER_TOKEN. Без него YCLIENTS не даёт "
+            "искать клиентов по базе, и те, кто уже есть в базе салона, не смогут "
+            "зарегистрироваться в боте.",
+            file=sys.stderr,
+        )
+
     missing = [name for name, value in required.items() if not value]
     if missing:
         print(
@@ -224,9 +232,69 @@ def get_seance_length(bath_id: str, day_type: str, with_proc: bool) -> int:
     return seconds
 
 
+def _phone_digits(phone: str) -> str:
+    """Оставляет от номера только цифры: +7 (999) 123-45-67 -> 79991234567.
+    YCLIENTS хранит телефон без плюса, поэтому искать надо по цифрам."""
+    return re.sub(r'\D', '', str(phone))
+
+
+async def find_client_by_phone(client: httpx.AsyncClient, phone: str, headers: dict) -> int:
+    """
+    Ищет клиента в базе YCLIENTS по номеру телефона.
+
+    Нужно для тех, кто уже есть в базе салона (записывался по телефону, заведён
+    администратором), но в боте ещё не регистрировался: создать его повторно
+    YCLIENTS не даст, а работать он должен под своим существующим id.
+
+    Returns:
+        int: id клиента в YCLIENTS или 0, если не нашли
+    """
+    digits = _phone_digits(phone)
+
+    # Основной способ — поиск по базе клиентов. Требует User-токен.
+    search_url = f"https://api.yclients.com/api/v1/company/{YCLIENTS_COMPANY_ID}/clients/search"
+    payload = {
+        "fields": ["id", "name", "phone"],
+        "filters": [{"type": "quick_search", "state": {"value": digits}}],
+        "page": 1,
+        "page_size": 10,
+    }
+    try:
+        resp = await client.post(search_url, json=payload, headers=headers, timeout=10.0)
+        if resp.status_code == 200:
+            for item in resp.json().get("data") or []:
+                if _phone_digits(item.get("phone", "")) == digits:
+                    logger.info(f"Клиент найден в базе YCLIENTS: id={item['id']}")
+                    return int(item["id"])
+            logger.info(f"Поиск по базе не дал совпадений для {digits}")
+        else:
+            logger.error(f"Yclients clients/search error: {resp.status_code} {resp.text}")
+    except Exception as e:
+        logger.error(f"Yclients clients/search exception: {e}")
+
+    # Запасной способ — старый GET-фильтр по списку клиентов.
+    list_url = f"https://api.yclients.com/api/v1/clients/{YCLIENTS_COMPANY_ID}"
+    try:
+        resp = await client.get(list_url, headers=headers, params={"phone": digits}, timeout=10.0)
+        if resp.status_code == 200:
+            for item in resp.json().get("data") or []:
+                if _phone_digits(item.get("phone", "")) == digits:
+                    logger.info(f"Клиент найден через GET /clients: id={item['id']}")
+                    return int(item["id"])
+        else:
+            logger.error(f"Yclients GET clients error: {resp.status_code} {resp.text}")
+    except Exception as e:
+        logger.error(f"Yclients GET clients exception: {e}")
+
+    return 0
+
+
 async def register_in_yclients(name: str, phone: str, telegram_id: int) -> tuple[bool, int]:
     """
-    Регистрирует нового клиента в YCLIENTS или находит существующего по телефону
+    Находит клиента в базе YCLIENTS по телефону, а если его там нет — создаёт.
+
+    Сначала ищем, потом создаём: клиент может уже быть в базе салона, хотя в боте
+    он впервые. Повторное создание YCLIENTS отклонит, и человек упрётся в ошибку.
 
     Args:
         name: Имя и фамилия клиента
@@ -246,26 +314,30 @@ async def register_in_yclients(name: str, phone: str, telegram_id: int) -> tuple
 
     try:
         async with httpx.AsyncClient() as client:
+            existing_id = await find_client_by_phone(client, phone, headers)
+            if existing_id:
+                logger.info(f"Клиент {phone} уже есть в базе, используем id={existing_id}")
+                return True, existing_id
+
             logger.info(f"Отправляем запрос регистрации в YCLIENTS: {name}, {phone}")
             response = await client.post(url, json=payload, headers=headers, timeout=10.0)
-            data = response.json()
 
-            if response.status_code == 201:
-                logger.info(f"Клиент успешно зарегистрирован в YCLIENTS: id={data['data']['id']}")
-                return True, data['data']['id']
-            elif response.status_code == 422:
-                # YCLIENTS возвращает 422 в т.ч. когда клиент с этим телефоном уже есть.
-                # Текст ошибки может быть на русском, поэтому не матчим конкретную
-                # строку — просто пробуем найти клиента по телефону.
-                logger.info(f"Регистрация вернула 422 ({data}), ищем клиента по телефону: {phone}")
-                search_url = f"https://api.yclients.com/api/v1/clients/{YCLIENTS_COMPANY_ID}"
-                search_resp = await client.get(search_url, headers=headers, params={"phone": phone})
-                search_data = search_resp.json()
-                if search_data.get('data'):
-                    logger.info(f"Найден существующий клиент: id={search_data['data'][0]['id']}")
-                    return True, search_data['data'][0]['id']
+            if response.status_code in (200, 201):
+                data = response.json()
+                client_id = (data.get('data') or {}).get('id')
+                if client_id:
+                    logger.info(f"Клиент успешно зарегистрирован в YCLIENTS: id={client_id}")
+                    return True, int(client_id)
 
+            # Создать не вышло. Частый случай — клиент всё-таки есть в базе,
+            # но поиск его не увидел (другой формат номера, права токена).
+            # Пробуем найти ещё раз, прежде чем сдаваться.
             logger.error(f"Yclients register error: {response.status_code} {response.text}")
+            existing_id = await find_client_by_phone(client, phone, headers)
+            if existing_id:
+                logger.info(f"Клиент найден после неудачного создания: id={existing_id}")
+                return True, existing_id
+
             return False, 0
     except Exception as e:
         logger.error(f"Yclients exception: {e}")
@@ -448,7 +520,11 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
     else:
         logger.error(f"Ошибка регистрации пользователя {update.effective_user.id}")
-        await update.message.reply_text("Ошибка регистрации 😔 Попробуйте /start позже")
+        await update.message.reply_text(
+            "Не получилось вас зарегистрировать 😔\n\n"
+            "Попробуйте /start позже или напишите менеджеру:\n"
+            f"👤 {MANAGER_NAME}\n📱 {MANAGER_PHONE}"
+        )
 
     return ConversationHandler.END
 
