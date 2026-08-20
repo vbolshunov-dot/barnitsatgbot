@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import httpx
+from collections import Counter
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKeyboardButton, InlineKeyboardMarkup
@@ -53,6 +54,14 @@ MANAGER_TG_URL = os.getenv("MANAGER_TG_URL", "https://t.me/+79215530572")
 # отрицательный, вида -1001234567890 — минус обязателен.
 # Пусто — уведомления просто не отправляются, на бронирование это не влияет.
 BOOKING_GROUP_CHAT_ID = os.getenv("BOOKING_GROUP_CHAT_ID", "")
+
+# Категория YCLIENTS, из которой берутся процедуры банного меню. Предлагаются
+# только те её услуги, у которых включена онлайн-запись, — так список правится
+# в кабинете, а не в коде: снял галку, и процедура пропала из бота.
+PROCEDURES_CATEGORY_ID = int(os.getenv("PROCEDURES_CATEGORY_ID", "26014494"))
+# Насколько доверяем закэшированному прайсу. Цены меняются редко, а дёргать
+# API на каждом шаге брони незачем.
+SERVICES_CACHE_MINUTES = 10
 
 # Файл для сохранения состояния диалогов между перезапусками бота
 PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "bot_persistence.pickle")
@@ -217,10 +226,10 @@ logger = logging.getLogger(__name__)
 # состояния для сonversationHandler регистрации
 NAME, PHONE, CONFIRM = range(3)
 # состояния для сonversationHandler бронирования
-CHOOSE_BATH, CHOOSE_DAY_TYPE, WITH_PROCEDURES, GUEST_COUNT, BOOK_DATE, BOOK_TIME = range(3, 9)
+CHOOSE_BATH, CHOOSE_DAY_TYPE, WITH_PROCEDURES, GUEST_COUNT, PICK_PROCEDURES, BOOK_DATE, BOOK_TIME = range(3, 10)
 
 # ключи временных данных бронирования (сбрасываются при /cancel и /start)
-BOOKING_KEYS = ("bath_id", "day_type", "with_procedures", "guest_count", "book_date")
+BOOKING_KEYS = ("bath_id", "day_type", "with_procedures", "guest_count", "book_date", "procedures")
 
 # регулярка для валидации российского номера телефона
 PHONE_REGEX = re.compile(r'^\+7\d{10}$')
@@ -289,6 +298,103 @@ def get_seance_length(bath_id: str, day_type: str, with_proc: bool) -> int:
     seconds = hours * 3600
     logger.info(f"Длительность сеанса: {hours} ч ({seconds} сек)")
     return seconds
+
+
+def money(value) -> str:
+    """12000 -> '12 000 ₽'. Неразрывный пробел, чтобы цена не рвалась на строки."""
+    return f"{int(value):,}".replace(",", " ") + " ₽"
+
+
+# Прайс целиком, одним запросом на все услуги: {id: {"title": ..., "price": ...}}
+SERVICES_CACHE: dict = {"at": None, "index": {}}
+
+
+async def get_services_index() -> dict:
+    """
+    Возвращает справочник услуг филиала с ценами, обновляя его не чаще раза
+    в SERVICES_CACHE_MINUTES минут.
+
+    Цены берём из YCLIENTS, а не из кода: поменял прайс в кабинете — бот
+    подхватил сам, деплой не нужен.
+
+    Returns:
+        dict: {service_id: {"title", "price", "category_id", "is_online"}}
+    """
+    now = datetime.now()
+    cached_at = SERVICES_CACHE["at"]
+    if cached_at and (now - cached_at) < timedelta(minutes=SERVICES_CACHE_MINUTES):
+        return SERVICES_CACHE["index"]
+
+    url = f"https://api.yclients.com/api/v1/company/{YCLIENTS_COMPANY_ID}/services/"
+    headers = {"Authorization": yclients_auth_header(), "Accept": "application/vnd.yclients.v2+json"}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers, timeout=10.0)
+            if response.status_code != 200:
+                logger.error(f"services вернул {response.status_code}: {response.text}")
+                return SERVICES_CACHE["index"]
+            services = response.json().get('data') or []
+    except Exception as e:
+        logger.error(f"Ошибка получения услуг: {e}")
+        # Отдаём то, что было: устаревшая цена лучше, чем сорванная бронь
+        return SERVICES_CACHE["index"]
+
+    index = {
+        int(service["id"]): {
+            "title": service.get("title") or "",
+            "price": service.get("price_min") or 0,
+            "category_id": service.get("category_id"),
+            "is_online": bool(service.get("is_online")),
+        }
+        for service in services if service.get("id")
+    }
+    SERVICES_CACHE.update(at=now, index=index)
+    logger.info(f"Прайс обновлён: {len(index)} услуг")
+    return index
+
+
+async def get_procedures() -> list:
+    """
+    Процедуры банного меню, доступные для онлайн-записи.
+
+    Returns:
+        list: [{"id", "title", "price"}], отсортированы по цене — дешёвые сверху
+    """
+    index = await get_services_index()
+    procedures = [
+        {"id": service_id, "title": item["title"], "price": item["price"]}
+        for service_id, item in index.items()
+        if item["category_id"] == PROCEDURES_CATEGORY_ID and item["is_online"]
+    ]
+    procedures.sort(key=lambda p: (p["price"], p["title"]))
+    logger.info(f"Процедур доступно: {len(procedures)}")
+    return procedures
+
+
+def price_breakdown(bath_title: str, bath_price: int, chosen: list, index: dict) -> tuple:
+    """
+    Собирает расшифровку стоимости брони.
+
+    Args:
+        chosen: id выбранных процедур, повторы значимы (двое взяли одно и то же)
+        index: справочник из get_services_index()
+
+    Returns:
+        tuple: (строки расшифровки, итоговая сумма)
+    """
+    lines = [f"🌿 {bath_title} — {money(bath_price)}"]
+    total = int(bath_price)
+
+    for service_id, count in Counter(chosen).items():
+        item = index.get(service_id) or {}
+        price = int(item.get("price") or 0)
+        title = item.get("title") or f"услуга {service_id}"
+        suffix = f" × {count}" if count > 1 else ""
+        lines.append(f"💆 {title}{suffix} — {money(price * count)}")
+        total += price * count
+
+    return lines, total
 
 
 def seance_end(start: str, bath_id: str, day_type: str, with_proc: bool) -> str:
@@ -529,7 +635,7 @@ async def get_free_seances(bath_id: str, day_type: str, with_proc: bool, date: s
     return free
 
 
-async def create_booking(yclients_id: int, staff_id: int, service_id: int, datetime_str: str, comment: str,
+async def create_booking(yclients_id: int, staff_id: int, services: list, datetime_str: str, comment: str,
                          seance_length: int) -> bool:
     """
     Создаёт запись на услугу в YCLIENTS
@@ -537,7 +643,8 @@ async def create_booking(yclients_id: int, staff_id: int, service_id: int, datet
     Args:
         yclients_id: ID клиента в YCLIENTS
         staff_id: ID сотрудника (бани)
-        service_id: ID услуги
+        services: услуги записи в виде [{"id": ..., "amount": ...}] — аренда бани
+                  плюс выбранные процедуры
         datetime_str: Дата и время в формате "YYYY-MM-DD HH:MM:SS"
         comment: Комментарий к записи
         seance_length: Длительность сеанса В СЕКУНДАХ
@@ -553,7 +660,7 @@ async def create_booking(yclients_id: int, staff_id: int, service_id: int, datet
     }
     payload = {
         "staff_id": staff_id,
-        "services": [{"id": service_id}],
+        "services": services,
         "client": {"id": yclients_id},
         "datetime": datetime_str,
         "seance_length": seance_length,
@@ -563,7 +670,7 @@ async def create_booking(yclients_id: int, staff_id: int, service_id: int, datet
     try:
         async with httpx.AsyncClient() as client:
             logger.info(
-                f"Создаём запись в YCLIENTS: client_id={yclients_id}, service_id={service_id}, datetime={datetime_str}")
+                f"Создаём запись в YCLIENTS: client_id={yclients_id}, услуги={services}, datetime={datetime_str}")
             response = await client.post(url, json=payload, headers=headers, timeout=10.0)
             if response.status_code == 201:
                 logger.info("Запись успешно создана в YCLIENTS")
@@ -606,7 +713,9 @@ async def notify_group_about_booking(context: ContextTypes.DEFAULT_TYPE, user, d
         f"📅 Дата: {details['date']} ({details['day_text']})\n"
         f"⏰ Сеанс: {details['start']} – {details['end']}\n"
         f"💆 Процедуры: {details['proc_text']}\n"
-        f"👥 Гостей: {details['guests']}"
+        f"🧖 Банное меню: {html.escape(str(details.get('procedures', 'нет')))}\n"
+        f"👥 Гостей: {details['guests']}\n"
+        f"💰 Итого: {money(details.get('total', 0))}"
     )
 
     try:
@@ -898,13 +1007,20 @@ async def guest_count(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return GUEST_COUNT
 
     context.user_data['guest_count'] = count
+    context.user_data['procedures'] = []
     logger.info(f"Пользователь {update.effective_user.id} указал количество гостей: {count}")
 
-    bath = BATHS[context.user_data['bath_id']]
-    day_text = "Будни" if context.user_data['day_type'] == "weekday" else "Выходные"
-    proc_text = "с процедурами" if context.user_data['with_procedures'] else "без процедур"
+    if context.user_data['with_procedures']:
+        procedures = await get_procedures()
+        if procedures:
+            text, markup = procedures_screen(procedures, [], count, booking_header(context))
+            await update.message.reply_text(text, reply_markup=markup)
+            return PICK_PROCEDURES
+        # Прайс не отдался — не держим человека на пустом экране, пусть
+        # бронирует баню, а процедуры согласует менеджер.
+        logger.error("Не удалось получить процедуры, пропускаем шаг выбора")
 
-    await show_date_keyboard_message(update, context, f"{bath['name']}\n{day_text}\n{proc_text}\nГостей: {count}")
+    await show_date_keyboard_message(update, context, booking_header(context))
     return BOOK_DATE
 
 
@@ -961,6 +1077,57 @@ async def contact_manager_callback(update: Update, context: ContextTypes.DEFAULT
         # после чего бот требовал регистрироваться заново. Чистим только бронь.
         clear_booking_data(context)
         return ConversationHandler.END
+
+
+def procedures_screen(procedures: list, chosen: list, needed: int, header: str) -> tuple:
+    """
+    Готовит текст и клавиатуру выбора процедур.
+
+    Процедур нужно ровно столько же, сколько гостей: по одной на человека.
+    Повторы разрешены — трое могут взять одно и то же.
+
+    Returns:
+        tuple: (текст сообщения, InlineKeyboardMarkup)
+    """
+    index = {p["id"]: p for p in procedures}
+    picked_lines = [
+        f"  • {index[service_id]['title']}" + (f" × {count}" if count > 1 else "")
+        for service_id, count in Counter(chosen).items() if service_id in index
+    ]
+
+    text = (
+        f"{header}\n\n"
+        f"Выберите процедуры — по одной на каждого гостя.\n"
+        f"Одну и ту же можно взять несколько раз.\n\n"
+        f"Выбрано: {len(chosen)} из {needed}"
+    )
+    if picked_lines:
+        text += "\n" + "\n".join(picked_lines)
+
+    keyboard = []
+    if len(chosen) < needed:
+        for procedure in procedures:
+            keyboard.append([InlineKeyboardButton(
+                f"{procedure['title']} — {money(procedure['price'])}",
+                callback_data=f"pick_{procedure['id']}"
+            )])
+    if chosen:
+        keyboard.append([InlineKeyboardButton("↩️ Убрать последнюю", callback_data="pick_undo")])
+    if len(chosen) == needed:
+        keyboard.append([InlineKeyboardButton("✅ Дальше, к выбору даты", callback_data="pick_done")])
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_procedures")])
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="book_cancel")])
+
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+def booking_header(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Шапка «баня / дни / процедуры / гостей» — она повторяется на всех экранах."""
+    bath = BATHS[context.user_data['bath_id']]
+    day_text = "Будни" if context.user_data['day_type'] == "weekday" else "Выходные"
+    proc_text = "с процедурами" if context.user_data['with_procedures'] else "без процедур"
+    return (f"Баня: {bath['name']}\nДни: {day_text}\nПроцедуры: {proc_text}\n"
+            f"Гостей: {context.user_data['guest_count']}")
 
 
 def build_date_buttons(day_type: str, days_ahead: int = DAYS_AHEAD) -> list:
@@ -1037,6 +1204,62 @@ async def show_date_keyboard_message(update: Update, context: ContextTypes.DEFAU
         f"{bath_name}\nВыберите дату:",
         reply_markup=date_markup(context.user_data['day_type']),
     )
+
+
+async def pick_procedures(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Набор процедур: по одной на гостя, повторы разрешены"""
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "book_cancel":
+        logger.info(f"Пользователь {update.effective_user.id} отменил бронирование")
+        await query.edit_message_text("Бронирование отменено.")
+        return ConversationHandler.END
+
+    if query.data == "back_procedures":
+        bath = BATHS[context.user_data['bath_id']]
+        day_text = "Будни" if context.user_data['day_type'] == "weekday" else "Выходные"
+        context.user_data['procedures'] = []
+        logger.info(f"Пользователь {update.effective_user.id} вернулся к выбору процедур")
+        keyboard = [
+            [InlineKeyboardButton("С парением/процедурами", callback_data="proc_yes")],
+            [InlineKeyboardButton("Без процедур", callback_data="proc_no")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_day_type")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="book_cancel")]
+        ]
+        await query.edit_message_text(
+            f"Баня: {bath['name']}\nДни: {day_text}\n\nНужны процедуры/парение?",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return WITH_PROCEDURES
+
+    chosen = context.user_data.setdefault('procedures', [])
+    needed = context.user_data['guest_count']
+
+    if query.data == "pick_done":
+        if len(chosen) != needed:
+            await query.answer(f"Нужно выбрать ровно {needed}", show_alert=True)
+            return PICK_PROCEDURES
+        logger.info(f"Пользователь {update.effective_user.id} выбрал процедуры: {chosen}")
+        await query.edit_message_text(
+            f"{booking_header(context)}\nВыберите дату:",
+            reply_markup=date_markup(context.user_data['day_type'])
+        )
+        return BOOK_DATE
+
+    if query.data == "pick_undo":
+        if chosen:
+            chosen.pop()
+    else:
+        if len(chosen) >= needed:
+            await query.answer(f"Уже выбрано {needed}, больше не нужно", show_alert=True)
+            return PICK_PROCEDURES
+        chosen.append(int(query.data.split("_")[1]))
+
+    procedures = await get_procedures()
+    text, markup = procedures_screen(procedures, chosen, needed, booking_header(context))
+    await query.edit_message_text(text, reply_markup=markup)
+    return PICK_PROCEDURES
 
 
 async def book_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1185,12 +1408,28 @@ async def book_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     await query.edit_message_text(f"Бронирую {bath['name']} на {date_iso} в {time_str}... ⏳")
 
-    comment = f"Бронь {bath['name']} через Telegram бота\nДни: {day_text}\nПроцедуры: {proc_text}\nГостей: {guest_count}"
+    # Аренда бани плюс процедуры — одной записью, чтобы YCLIENTS сам посчитал
+    # стоимость и всё легло в отчёты. Повторы схлопываем в amount.
+    chosen = context.user_data.get('procedures') or []
+    services = [{"id": service_id, "amount": 1}]
+    services += [{"id": pid, "amount": count} for pid, count in Counter(chosen).items()]
+
+    index = await get_services_index()
+    bath_title = (index.get(service_id) or {}).get("title") or f"Аренда бани «{bath['name']}»"
+    lines, total = price_breakdown(bath_title, (index.get(service_id) or {}).get("price") or 0, chosen, index)
+
+    procedures_text = ", ".join(
+        f"{(index.get(pid) or {}).get('title', pid)}" + (f" ×{count}" if count > 1 else "")
+        for pid, count in Counter(chosen).items()
+    ) or "нет"
+
+    comment = (f"Бронь {bath['name']} через Telegram бота\nДни: {day_text}\nПроцедуры: {proc_text}\n"
+               f"Гостей: {guest_count}\nБанное меню: {procedures_text}")
 
     success = await create_booking(
         yclients_id=int(context.user_data['yclients_id']),
         staff_id=int(bath['staff_id']),
-        service_id=service_id,
+        services=services,
         datetime_str=datetime_str,
         comment=comment,
         seance_length=seance_length
@@ -1214,18 +1453,21 @@ async def book_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 "end": end_str,
                 "proc_text": proc_text,
                 "guests": guest_count,
+                "procedures": procedures_text,
+                "total": total,
             },
         )
         await query.edit_message_text(
             f"Готово! Баня забронирована ✅\n\n"
             f"🌿 Баня: {bath['name']}\n"
-            f"📅 Дни: {day_text}\n"
-            f"💆 Процедуры: {proc_text}\n"
-            f"👥 Гостей: {guest_count}\n"
-            f"📅 Дата: {date_iso}\n"
+            f"📅 Дата: {date_iso} ({day_text})\n"
             f"⏰ Сеанс: {time_str} – {end_str}\n"
-            f"⏳ Длительность: {seance_length // 3600} ч\n\n"
-            f"Нужно больше времени? Напишите или позвоните менеджеру:\n"
+            f"👥 Гостей: {guest_count}\n\n"
+            + "\n".join(lines) + "\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"💰 Итого: {money(total)}\n\n"
+            f"По поводу предоплаты вам в скором времени напишет менеджер.\n\n"
+            f"Нужно больше времени? Напишите или позвоните:\n"
             f"👤 {MANAGER_NAME}\n"
             f"📱 {MANAGER_PHONE}\n\n"
             f"Ждём вас!",
@@ -1411,6 +1653,9 @@ def main() -> None:
             GUEST_COUNT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, guest_count),
                 CallbackQueryHandler(contact_manager_callback, pattern="^contact_manager|back_guest_count|book_cancel")
+            ],
+            PICK_PROCEDURES: [
+                CallbackQueryHandler(pick_procedures, pattern="^pick_|back_procedures|book_cancel")
             ],
             BOOK_DATE: [CallbackQueryHandler(book_date, pattern="^date_|back_procedures|back_date|book_cancel")],
             BOOK_TIME: [CallbackQueryHandler(book_time, pattern="^time_|back_date|book_cancel")],
