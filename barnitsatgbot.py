@@ -411,46 +411,122 @@ async def register_in_yclients(name: str, phone: str, telegram_id: int) -> tuple
         return False, 0
 
 
-async def get_free_slots(staff_id: int, service_id: int, date: str) -> list:
-    """
-    Получает список свободных временных слотов из YCLIENTS
+def _parse_local(value: str) -> datetime:
+    """YCLIENTS отдаёт время вида 2026-08-26T10:00:00+03:00. Часовой пояс
+    у филиала один и тот же, поэтому берём первые 19 символов и работаем
+    в местном времени — так проще и не надо тащить tz-арифметику."""
+    return datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
 
-    Args:
-        staff_id: ID сотрудника (бани) в YCLIENTS
-        service_id: ID услуги в YCLIENTS
-        date: Дата в формате YYYY-MM-DD
+
+async def get_working_intervals(staff_id: int, date: str) -> list:
+    """
+    Возвращает рабочие интервалы бани на дату по графику YCLIENTS.
 
     Returns:
-        list: Список слотов с временем
+        list: пары (начало, конец) как datetime; пустой список — выходной
+              или запрос не удался
     """
-    url = f"https://api.yclients.com/api/v1/book_times/{YCLIENTS_COMPANY_ID}/{staff_id}/{date}"
-    headers = {
-        "Authorization": yclients_auth_header(),
-        "Accept": "application/vnd.yclients.v2+json"
-    }
-    params = {"service_ids[]": service_id}
+    url = f"https://api.yclients.com/api/v1/schedule/{YCLIENTS_COMPANY_ID}/{staff_id}/{date}/{date}"
+    headers = {"Authorization": yclients_auth_header(), "Accept": "application/vnd.yclients.v2+json"}
 
     try:
         async with httpx.AsyncClient() as client:
-            logger.info(f"Запрашиваем свободные слоты: staff_id={staff_id}, service_id={service_id}, date={date}")
-            response = await client.get(url, headers=headers, params=params, timeout=10.0)
-            data = response.json()
-            slots = data.get('data', [])
-            # Печатаем сами времена, а не только количество: если нужный заход
-            # не появился в боте, по этой строке видно, отдал его YCLIENTS или нет.
-            times = [s.get('time') for s in slots]
-            logger.info(f"Получено слотов: {len(slots)} -> {times}")
-            # Слот целиком: в нём YCLIENTS сообщает свою длительность сеанса
-            # (seance_length). Если она расходится с SERVICE_DURATIONS, сетка
-            # свободного времени поедет, и понять это можно только отсюда.
-            if slots:
-                logger.info(f"Первый слот как есть: {slots[0]}")
+            response = await client.get(url, headers=headers, timeout=10.0)
             if response.status_code != 200:
-                logger.error(f"book_times вернул {response.status_code}: {response.text}")
-            return slots
+                logger.error(f"schedule вернул {response.status_code}: {response.text}")
+                return []
+            days = response.json().get('data') or []
     except Exception as e:
-        logger.error(f"Ошибка получения слотов: {e}")
+        logger.error(f"Ошибка получения графика: {e}")
         return []
+
+    intervals = []
+    for day in days:
+        if not day.get('is_working'):
+            continue
+        for slot in day.get('slots') or []:
+            start = datetime.strptime(f"{date} {slot['from']}", "%Y-%m-%d %H:%M")
+            end = datetime.strptime(f"{date} {slot['to']}", "%Y-%m-%d %H:%M")
+            intervals.append((start, end))
+
+    logger.info(f"График бани {staff_id} на {date}: {[(s.strftime('%H:%M'), e.strftime('%H:%M')) for s, e in intervals]}")
+    return intervals
+
+
+async def get_busy_intervals(staff_id: int, date: str) -> list:
+    """
+    Возвращает занятые интервалы бани на дату по журналу записей.
+
+    Returns:
+        tuple: (успех, список пар (начало, конец) как datetime). Успех False
+               означает, что журнал прочитать не удалось — предлагать заходы
+               в этом случае нельзя, иначе можно посадить двоих на один сеанс.
+    """
+    url = f"https://api.yclients.com/api/v1/records/{YCLIENTS_COMPANY_ID}"
+    headers = {"Authorization": yclients_auth_header(), "Accept": "application/vnd.yclients.v2+json"}
+    params = {"staff_id": staff_id, "start_date": date, "end_date": date, "count": 200}
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers, params=params, timeout=10.0)
+            if response.status_code != 200:
+                logger.error(f"records вернул {response.status_code}: {response.text}")
+                return False, []
+            records = response.json().get('data') or []
+    except Exception as e:
+        logger.error(f"Ошибка получения записей: {e}")
+        return False, []
+
+    busy = []
+    for record in records:
+        if record.get('deleted'):
+            continue
+        start = _parse_local(record['datetime'])
+        busy.append((start, start + timedelta(seconds=int(record.get('seance_length') or 0))))
+
+    logger.info(f"Занято в бане {staff_id} на {date}: {[(s.strftime('%H:%M'), e.strftime('%H:%M')) for s, e in busy]}")
+    return True, busy
+
+
+async def get_free_seances(bath_id: str, day_type: str, with_proc: bool, date: str) -> list:
+    """
+    Считает, какие фиксированные заходы свободны, НЕ спрашивая book_times.
+
+    Клиентский метод book_times у этого филиала отдаёт сетку, которая не
+    совпадает ни с графиком бани, ни с настройками услуги: он молча срезает
+    первый час рабочего дня. Из-за этого утренний заход в 10:00 не появлялся
+    в боте, хотя баня свободна, а административный метод записи такую бронь
+    спокойно создаёт. Поэтому занятость считаем сами: график минус журнал.
+
+    Returns:
+        list: времена начала свободных заходов, например ["10:00", "18:00"]
+    """
+    staff_id = int(BATHS[bath_id]['staff_id'])
+    hours = get_seance_length(bath_id, day_type, with_proc) // 3600
+
+    working = await get_working_intervals(staff_id, date)
+    if not working:
+        logger.info(f"Баня {bath_id} на {date} не работает или график не получен")
+        return []
+
+    ok, busy = await get_busy_intervals(staff_id, date)
+    if not ok:
+        return []
+
+    free = []
+    for start_str in SEANCE_STARTS[bath_id][day_type]:
+        start = datetime.strptime(f"{date} {start_str}", "%Y-%m-%d %H:%M")
+        end = start + timedelta(hours=hours)
+        if not any(w_start <= start and end <= w_end for w_start, w_end in working):
+            continue
+        # Пересечение интервалов: заход занят, если он с чем-то накладывается.
+        # Касание встык (10:00-13:00 и 13:00-16:00) пересечением не считается.
+        if any(start < b_end and b_start < end for b_start, b_end in busy):
+            continue
+        free.append(start_str)
+
+    logger.info(f"Свободные заходы {bath_id}/{day_type} на {date}: {free}")
+    return free
 
 
 async def create_booking(yclients_id: int, staff_id: int, service_id: int, datetime_str: str, comment: str,
@@ -937,30 +1013,21 @@ def date_markup(day_type: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(keyboard)
 
 
-def build_time_buttons(bath_id: str, day_type: str, with_proc: bool, slots: list) -> list:
+def build_time_buttons(bath_id: str, day_type: str, with_proc: bool, free_starts: list) -> list:
     """
-    Оставляет только фиксированные сеансы бани, которые YCLIENTS отдал свободными.
-
-    Раньше показывалась вся сетка свободного времени из YCLIENTS, и клиент мог
-    выбрать, например, 11:30 — в реальный график заходов это не укладывается.
+    Собирает кнопки под свободные заходы.
 
     Args:
-        slots: ответ get_free_slots(); нас интересует поле time вида "10:00"
+        free_starts: времена начала из get_free_seances(), например ["10:00"]
 
     Returns:
         list: ряды кнопок вида "10:00 – 13:00" (без "Назад"/"Отмена")
     """
-    free = {slot.get('time') for slot in slots}
-    starts = SEANCE_STARTS[bath_id][day_type]
-
     buttons = []
-    for start in starts:
-        if start not in free:
-            continue
+    for start in free_starts:
         end = seance_end(start, bath_id, day_type, with_proc)
         buttons.append([InlineKeyboardButton(f"{start} – {end}", callback_data=f"time_{start}")])
 
-    logger.info(f"Свободных сеансов для {bath_id}/{day_type}: {len(buttons)} из {len(starts)}")
     return buttons
 
 
@@ -1044,10 +1111,13 @@ async def book_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"Баня: {bath['name']}\nДни: {day_text}\nПроцедуры: {proc_text}\nГостей: {guest_count}\nДата: {date_iso}\nИщу свободное время... ⏳"
     )
 
-    slots = await get_free_slots(int(bath['staff_id']), service_id, date_iso)
+    free_starts = await get_free_seances(
+        context.user_data['bath_id'], context.user_data['day_type'],
+        context.user_data['with_procedures'], date_iso
+    )
     keyboard = build_time_buttons(
         context.user_data['bath_id'], context.user_data['day_type'],
-        context.user_data['with_procedures'], slots
+        context.user_data['with_procedures'], free_starts
     )
 
     if not keyboard:
