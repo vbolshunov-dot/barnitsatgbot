@@ -313,6 +313,16 @@ def get_seance_length(bath_id: str, day_type: str, with_proc: bool) -> int:
     return seconds
 
 
+WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+
+
+def format_date_ru(date_iso: str) -> str:
+    """2026-08-26 -> '26.08.2026, среда'. Для администратора день недели
+    понятнее, чем «будни»: сразу видно, о каком дне речь."""
+    day = datetime.strptime(date_iso, "%Y-%m-%d")
+    return f"{day.strftime('%d.%m.%Y')}, {WEEKDAYS_RU[day.weekday()]}"
+
+
 def money(value) -> str:
     """12000 -> '12 000 ₽'. Неразрывный пробел, чтобы цена не рвалась на строки."""
     return f"{int(value):,}".replace(",", " ") + " ₽"
@@ -723,7 +733,7 @@ async def notify_group_about_booking(context: ContextTypes.DEFAULT_TYPE, user, d
         f"✈️ {account}\n"
         f"🆔 <code>{user.id}</code>\n\n"
         f"🌿 Баня: {details['bath']}\n"
-        f"📅 Дата: {details['date']} ({details['day_text']})\n"
+        f"📅 Дата: {format_date_ru(details['date'])}\n"
         f"⏰ Сеанс: {details['start']} – {details['end']}\n"
         f"💆 Процедуры: {details['proc_text']}\n"
         f"🧖 Банное меню: {html.escape(str(details.get('procedures', 'нет')))}\n"
@@ -1499,7 +1509,6 @@ async def book_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 "phone": context.user_data.get('phone', '—'),
                 "bath": bath['name'],
                 "date": date_iso,
-                "day_text": day_text,
                 "start": time_str,
                 "end": end_str,
                 "proc_text": proc_text,
