@@ -43,6 +43,9 @@ YCLIENTS_COMPANY_ID = os.getenv("YCLIENTS_COMPANY_ID", "")
 # Контакты менеджера для индивидуальных бронирований
 MANAGER_PHONE = os.getenv("MANAGER_CONTACT_URL", "")
 MANAGER_NAME = os.getenv("MANAGER_NAME", "")
+# Ссылка на чат с менеджером — уходит в кнопки вида url=..., по ней открывается
+# диалог в Telegram. Формат t.me/+<номер> работает и без username у менеджера.
+MANAGER_TG_URL = os.getenv("MANAGER_TG_URL", "https://t.me/+79215530572")
 
 # Файл для сохранения состояния диалогов между перезапусками бота
 PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "bot_persistence.pickle")
@@ -164,6 +167,23 @@ SERVICE_DURATIONS = {
     }
 }
 
+# Фиксированное начало сеансов в каждой бане.
+# Клиенту предлагаются только эти варианты, а не вся сетка YCLIENTS: баня топится
+# под конкретный заход, между заходами нужен перерыв на уборку.
+# Конец сеанса не задаётся здесь, а считается из SERVICE_DURATIONS, чтобы кнопка
+# показывала ровно ту длительность, которая уйдёт в запись.
+#   Берёзовая (3 ч): 10:00-13:00, 14:00-17:00, 18:00-21:00
+#   Хвойная  (4 ч): 10:00-14:00, 16:00-20:00
+SEANCE_STARTS = {
+    "birch": ["10:00", "14:00", "18:00"],
+    "pine": ["10:00", "16:00"],
+}
+
+# На сколько дней вперёд предлагать даты и по сколько кнопок ставить в ряд.
+# Ряд из трёх коротких кнопок даёт втрое больше дат на том же экране.
+DAYS_AHEAD = 21
+DATE_COLUMNS = 3
+
 # настройка логирования
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -186,6 +206,22 @@ PHONE_REGEX = re.compile(r'^\+7\d{10}$')
 # Хранятся здесь, а не в bot_data: bot_data пиклится персистентностью,
 # а ConversationHandler не сериализуется.
 HANDLERS: dict = {}
+
+
+def book_button(text: str = "🌿 Забронировать баню") -> InlineKeyboardButton:
+    """Кнопка вместо подсказки «/book» — команду не надо набирать руками."""
+    return InlineKeyboardButton(text, callback_data="go_book")
+
+
+def start_button(text: str = "📝 Зарегистрироваться") -> InlineKeyboardButton:
+    """Кнопка вместо подсказки «/start»."""
+    return InlineKeyboardButton(text, callback_data="go_start")
+
+
+def manager_button(text: str = "📞 Написать менеджеру") -> InlineKeyboardButton:
+    """Кнопка-ссылка на чат с менеджером. Нажатие открывает диалог в Telegram
+    и не присылает боту callback — обработчик ей не нужен."""
+    return InlineKeyboardButton(text, url=MANAGER_TG_URL)
 
 
 def is_weekend(date_obj: datetime) -> bool:
@@ -442,7 +478,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     clear_booking_data(context)
     user = update.effective_user
     logger.info(f"Пользователь {user.id} начал регистрацию")
-    await update.message.reply_html(
+    # effective_message, а не message: сюда попадают и нажатия кнопки
+    # «Зарегистрироваться», у которых update.message пустой.
+    await update.effective_message.reply_html(
         f"Привет, {user.mention_html()}! Добро пожаловать в наш банный комплекс 🧖‍♂️\n\n"
         f"Для бронирования нужно зарегистрироваться.\n\n"
         f"Продолжая, вы даёте согласие на обработку персональных данных "
@@ -516,14 +554,19 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         context.user_data['yclients_id'] = yclient_id
         logger.info(f"Пользователь {update.effective_user.id} успешно зарегистрирован, yclients_id={yclient_id}")
         await update.message.reply_text(
-            "Готово! Вы зарегистрированы ✅\n\nЗабронировать баню: /book"
+            "Готово! Вы зарегистрированы ✅",
+            reply_markup=InlineKeyboardMarkup([[book_button()]]),
         )
     else:
         logger.error(f"Ошибка регистрации пользователя {update.effective_user.id}")
         await update.message.reply_text(
             "Не получилось вас зарегистрировать 😔\n\n"
-            "Попробуйте /start позже или напишите менеджеру:\n"
-            f"👤 {MANAGER_NAME}\n📱 {MANAGER_PHONE}"
+            "Попробуйте ещё раз или напишите менеджеру:\n"
+            f"👤 {MANAGER_NAME}\n📱 {MANAGER_PHONE}",
+            reply_markup=InlineKeyboardMarkup([
+                [start_button("🔄 Попробовать снова")],
+                [manager_button()],
+            ]),
         )
 
     return ConversationHandler.END
@@ -549,7 +592,10 @@ async def book_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Обработчик команды /book - начало бронирования"""
     if 'yclients_id' not in context.user_data:
         logger.warning(f"Пользователь {update.effective_user.id} пытается бронировать без регистрации")
-        await update.message.reply_text("Сначала нужно зарегистрироваться. Жми /start")
+        await update.effective_message.reply_text(
+            "Сначала нужно зарегистрироваться — это одна минута:",
+            reply_markup=InlineKeyboardMarkup([[start_button()]]),
+        )
         return ConversationHandler.END
 
     logger.info(f"Пользователь {update.effective_user.id} начал бронирование")
@@ -744,30 +790,39 @@ async def contact_manager_callback(update: Update, context: ContextTypes.DEFAULT
             f"Дни: {day_text}\n"
             f"Процедуры: {proc_text}\n"
             f"Гостей: больше {bath['max_guests']}\n\n"
-            f"Позвоните или напишите в WhatsApp/Telegram менеджеру.\n"
-            f"Он уже видит ваши данные: {name}, {phone}\n\n"
-            f"Для новой попытки бронирования: /book"
+            f"Позвоните или напишите менеджеру.\n"
+            f"Он уже видит ваши данные: {name}, {phone}",
+            reply_markup=InlineKeyboardMarkup([
+                [manager_button()],
+                [book_button("🌿 Забронировать заново")],
+            ])
         )
-        context.user_data.clear()
+        # Раньше здесь был user_data.clear() — он стирал и регистрацию,
+        # после чего бот требовал регистрироваться заново. Чистим только бронь.
+        clear_booking_data(context)
         return ConversationHandler.END
 
 
-def build_date_buttons(day_type: str, days_ahead: int = 14) -> list:
+def build_date_buttons(day_type: str, days_ahead: int = DAYS_AHEAD) -> list:
     """
     Строит кнопки выбора даты, показывая ТОЛЬКО дни, подходящие под выбранный тип.
+
+    Отсчёт идёт с завтрашнего дня: баню нужно успеть протопить, записи «на сегодня»
+    через бота не принимаются — за ними отправляем к менеджеру.
 
     Args:
         day_type: "weekday" (Пн-Пт) или "weekend" (Сб-Вс)
         days_ahead: на сколько дней вперёд показывать
 
     Returns:
-        list: список рядов кнопок (без "Назад"/"Отмена")
+        list: список рядов кнопок по DATE_COLUMNS штук (без "Назад"/"Отмена")
     """
     buttons = []
+    row = []
     today = datetime.now()
     days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
-    for i in range(days_ahead):
+    for i in range(1, days_ahead + 1):
         day = today + timedelta(days=i)
         # Пропускаем даты, не соответствующие выбору пользователя
         if day_type == "weekend" and not is_weekend(day):
@@ -777,20 +832,60 @@ def build_date_buttons(day_type: str, days_ahead: int = 14) -> list:
         day_name = days_ru[day.weekday()]
         date_str = day.strftime(f"%d.%m {day_name}")
         date_iso = day.strftime("%Y-%m-%d")
-        buttons.append([InlineKeyboardButton(date_str, callback_data=f"date_{date_iso}")])
+        row.append(InlineKeyboardButton(date_str, callback_data=f"date_{date_iso}"))
+        if len(row) == DATE_COLUMNS:
+            buttons.append(row)
+            row = []
 
-    logger.info(f"Показано дат для day_type={day_type}: {len(buttons)}")
+    if row:
+        buttons.append(row)
+
+    logger.info(f"Показано дат для day_type={day_type}: {sum(len(r) for r in buttons)}")
+    return buttons
+
+
+def date_markup(day_type: str) -> InlineKeyboardMarkup:
+    """Клавиатура выбора даты вместе с навигацией — одна и та же на всех экранах,
+    куда можно вернуться к выбору даты."""
+    keyboard = build_date_buttons(day_type)
+    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_procedures")])
+    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="book_cancel")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_time_buttons(bath_id: str, day_type: str, with_proc: bool, slots: list) -> list:
+    """
+    Оставляет только фиксированные сеансы бани, которые YCLIENTS отдал свободными.
+
+    Раньше показывалась вся сетка свободного времени из YCLIENTS, и клиент мог
+    выбрать, например, 11:30 — в реальный график заходов это не укладывается.
+
+    Args:
+        slots: ответ get_free_slots(); нас интересует поле time вида "10:00"
+
+    Returns:
+        list: ряды кнопок вида "10:00 – 13:00" (без "Назад"/"Отмена")
+    """
+    free = {slot.get('time') for slot in slots}
+    hours = get_seance_length(bath_id, day_type, with_proc) // 3600
+
+    buttons = []
+    for start in SEANCE_STARTS[bath_id]:
+        if start not in free:
+            continue
+        end = (datetime.strptime(start, "%H:%M") + timedelta(hours=hours)).strftime("%H:%M")
+        buttons.append([InlineKeyboardButton(f"{start} – {end}", callback_data=f"time_{start}")])
+
+    logger.info(f"Свободных сеансов для {bath_id}: {len(buttons)} из {len(SEANCE_STARTS[bath_id])}")
     return buttons
 
 
 async def show_date_keyboard_message(update: Update, context: ContextTypes.DEFAULT_TYPE, bath_name: str):
-    """Показывает клавиатуру выбора даты на 2 недели вперёд"""
-    keyboard = build_date_buttons(context.user_data['day_type'])
-    keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_procedures")])
-    keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="book_cancel")])
-    markup = InlineKeyboardMarkup(keyboard)
-
-    await update.message.reply_text(f"{bath_name}\nВыберите дату:", reply_markup=markup)
+    """Показывает клавиатуру выбора даты на DAYS_AHEAD дней вперёд"""
+    await update.message.reply_text(
+        f"{bath_name}\nВыберите дату:",
+        reply_markup=date_markup(context.user_data['day_type']),
+    )
 
 
 async def book_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -826,18 +921,21 @@ async def book_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         guest_count = context.user_data['guest_count']
         logger.info(f"Пользователь {update.effective_user.id} вернулся к выбору даты")
 
-        keyboard = build_date_buttons(context.user_data['day_type'])
-        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_procedures")])
-        keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="book_cancel")])
-
         await query.edit_message_text(
             f"{bath['name']}\n{day_text}\n{proc_text}\nГостей: {guest_count}\nВыберите дату:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=date_markup(context.user_data['day_type'])
         )
         return BOOK_DATE
 
     date_iso = query.data.split("_")[1]
     date_obj = datetime.strptime(date_iso, "%Y-%m-%d")
+
+    # Кнопки строятся с завтрашнего дня, но сообщение могло провисеть до полуночи —
+    # тогда вчерашняя кнопка «на завтра» указывает на сегодня. Ловим это здесь.
+    if date_obj.date() <= datetime.now().date():
+        logger.info(f"Пользователь {update.effective_user.id} выбрал сегодняшнюю или прошедшую дату {date_iso}")
+        await query.answer("На сегодня записаться уже нельзя — выберите другой день", show_alert=True)
+        return BOOK_DATE
 
     # Проверяем соответствие выбранных будни/выходные и реальной даты
     is_weekend_selected = is_weekend(date_obj)
@@ -863,27 +961,33 @@ async def book_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
 
     slots = await get_free_slots(int(bath['staff_id']), service_id, date_iso)
+    keyboard = build_time_buttons(
+        context.user_data['bath_id'], context.user_data['day_type'],
+        context.user_data['with_procedures'], slots
+    )
 
-    if not slots:
-        logger.info(f"Нет свободных слотов для даты {date_iso}, service_id={service_id}")
+    if not keyboard:
+        logger.info(f"Нет свободных сеансов для даты {date_iso}, service_id={service_id}")
         await query.edit_message_text(
-            f"Баня: {bath['name']}\nДата: {date_iso}\n\nНа эту дату нет свободных слотов 😔",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("⬅️ Выбрать другую дату", callback_data="back_date")
-            ]])
+            f"Баня: {bath['name']}\nДата: {date_iso}\n\n"
+            f"На эту дату свободных сеансов нет 😔\n\n"
+            f"Выберите другой день или свяжитесь с менеджером — "
+            f"он подскажет, что можно придумать.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⬅️ Выбрать другую дату", callback_data="back_date")],
+                [manager_button()],
+                [InlineKeyboardButton("❌ Отмена", callback_data="book_cancel")],
+            ])
         )
         return BOOK_DATE
 
-    keyboard = []
-    for slot in slots[:12]:
-        time_str = slot['time']
-        keyboard.append([InlineKeyboardButton(time_str, callback_data=f"time_{time_str}")])
-
+    keyboard.append([manager_button("📞 Не подходит время — написать менеджеру")])
     keyboard.append([InlineKeyboardButton("⬅️ Другая дата", callback_data="back_date")])
     keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="book_cancel")])
 
     await query.edit_message_text(
-        f"Баня: {bath['name']}\nДни: {day_text}\nПроцедуры: {proc_text}\nГостей: {guest_count}\nДата: {date_iso}\nСвободное время:",
+        f"Баня: {bath['name']}\nДни: {day_text}\nПроцедуры: {proc_text}\nГостей: {guest_count}\nДата: {date_iso}\n\n"
+        f"Выберите сеанс:",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     return BOOK_TIME
@@ -906,13 +1010,9 @@ async def book_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         guest_count = context.user_data['guest_count']
         logger.info(f"Пользователь {update.effective_user.id} вернулся к выбору даты")
 
-        keyboard = build_date_buttons(context.user_data['day_type'])
-        keyboard.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_procedures")])
-        keyboard.append([InlineKeyboardButton("❌ Отмена", callback_data="book_cancel")])
-
         await query.edit_message_text(
             f"{bath['name']}\n{day_text}\n{proc_text}\nГостей: {guest_count}\nВыберите дату:",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=date_markup(context.user_data['day_type'])
         )
         return BOOK_DATE
 
@@ -956,12 +1056,17 @@ async def book_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"Нужно больше времени? Напишите или позвоните менеджеру:\n"
             f"👤 {MANAGER_NAME}\n"
             f"📱 {MANAGER_PHONE}\n\n"
-            f"Ждём вас!"
+            f"Ждём вас!",
+            reply_markup=InlineKeyboardMarkup([[manager_button()]])
         )
     else:
         logger.error(f"Не удалось создать бронирование для пользователя {update.effective_user.id}")
         await query.edit_message_text(
-            "Не удалось забронировать 😔 Слот уже заняли или ошибка.\nПопробуйте /book ещё раз"
+            "Не удалось забронировать 😔\nСеанс уже заняли, либо случилась ошибка.",
+            reply_markup=InlineKeyboardMarkup([
+                [book_button("🔄 Попробовать ещё раз")],
+                [manager_button()],
+            ])
         )
 
     # Очищаем данные бронирования из context
@@ -979,9 +1084,13 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     clear_booking_data(context)
     message = update.effective_message
     if message:
+        await message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
         await message.reply_text(
-            "Отменено.\n/book — бронирование\n/start — регистрация заново",
-            reply_markup=ReplyKeyboardRemove(),
+            "Что дальше?",
+            reply_markup=InlineKeyboardMarkup([
+                [book_button()],
+                [start_button("📝 Регистрация заново")],
+            ]),
         )
     return ConversationHandler.END
 
@@ -1006,9 +1115,13 @@ async def force_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     clear_booking_data(context)
     message = update.effective_message
     if message:
+        await message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
         await message.reply_text(
-            "Отменено.\n/book — бронирование\n/start — регистрация заново",
-            reply_markup=ReplyKeyboardRemove(),
+            "Что дальше?",
+            reply_markup=InlineKeyboardMarkup([
+                [book_button()],
+                [start_button("📝 Регистрация заново")],
+            ]),
         )
     # Иначе fallback cancel активного диалога ответит вторым сообщением
     raise ApplicationHandlerStop
@@ -1030,13 +1143,29 @@ async def force_book(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     raise ApplicationHandlerStop
 
 
+async def go_start_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «Зарегистрироваться» — делает то же, что команда /start."""
+    await update.callback_query.answer()
+    await force_start(update, context)  # внутри поднимает ApplicationHandlerStop
+
+
+async def go_book_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Кнопка «Забронировать баню» — делает то же, что команда /book."""
+    await update.callback_query.answer()
+    await force_book(update, context)  # внутри поднимает ApplicationHandlerStop
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /help"""
     await update.message.reply_text(
-        "/start - регистрация\n"
-        "/book - забронировать баню\n"
-        "/cancel - отменить текущее действие\n"
-        "/help - помощь"
+        "Чем помочь?\n\n"
+        "Кнопки ниже делают то же, что команды /start, /book и /cancel — "
+        "набирать их руками не обязательно.",
+        reply_markup=InlineKeyboardMarkup([
+            [book_button()],
+            [start_button("📝 Регистрация заново")],
+            [manager_button()],
+        ]),
     )
 
 
@@ -1111,6 +1240,12 @@ def main() -> None:
     application.add_handler(CommandHandler("start", force_start), group=0)
     application.add_handler(CommandHandler("cancel", force_cancel), group=0)
     application.add_handler(CommandHandler("book", force_book), group=0)
+
+    # Кнопки-дубликаты команд. Тоже в group=0: нажать их можно из старого
+    # сообщения, когда активен любой диалог, и сработать они должны так же
+    # безусловно, как сами команды.
+    application.add_handler(CallbackQueryHandler(go_start_callback, pattern="^go_start$"), group=0)
+    application.add_handler(CallbackQueryHandler(go_book_callback, pattern="^go_book$"), group=0)
 
     application.add_handler(reg_handler, group=1)
     application.add_handler(book_handler, group=1)
