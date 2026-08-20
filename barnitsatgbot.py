@@ -440,6 +440,11 @@ async def get_free_slots(staff_id: int, service_id: int, date: str) -> list:
             # не появился в боте, по этой строке видно, отдал его YCLIENTS или нет.
             times = [s.get('time') for s in slots]
             logger.info(f"Получено слотов: {len(slots)} -> {times}")
+            # Слот целиком: в нём YCLIENTS сообщает свою длительность сеанса
+            # (seance_length). Если она расходится с SERVICE_DURATIONS, сетка
+            # свободного времени поедет, и понять это можно только отсюда.
+            if slots:
+                logger.info(f"Первый слот как есть: {slots[0]}")
             if response.status_code != 200:
                 logger.error(f"book_times вернул {response.status_code}: {response.text}")
             return slots
