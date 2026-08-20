@@ -1,4 +1,5 @@
 #перед запуском бота, скрыть все API и ID
+import html
 import logging
 import os
 import re
@@ -47,6 +48,12 @@ MANAGER_NAME = os.getenv("MANAGER_NAME", "")
 # диалог в Telegram. Формат t.me/+<номер> работает и без username у менеджера.
 MANAGER_TG_URL = os.getenv("MANAGER_TG_URL", "https://t.me/+79215530572")
 
+# Чат, куда падают уведомления о новых бронях (рабочая группа администраторов).
+# ID узнаётся командой /chatid, отправленной в саму группу. У групп он
+# отрицательный, вида -1001234567890 — минус обязателен.
+# Пусто — уведомления просто не отправляются, на бронирование это не влияет.
+BOOKING_GROUP_CHAT_ID = os.getenv("BOOKING_GROUP_CHAT_ID", "")
+
 # Файл для сохранения состояния диалогов между перезапусками бота
 PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "bot_persistence.pickle")
 
@@ -78,6 +85,14 @@ def check_config() -> None:
             "ВНИМАНИЕ: не задан YCLIENTS_USER_TOKEN. Без него YCLIENTS не даёт "
             "искать клиентов по базе, и те, кто уже есть в базе салона, не смогут "
             "зарегистрироваться в боте.",
+            file=sys.stderr,
+        )
+
+    if not BOOKING_GROUP_CHAT_ID:
+        print(
+            "ВНИМАНИЕ: не задан BOOKING_GROUP_CHAT_ID — уведомления о новых бронях "
+            "в рабочую группу отправляться не будут. Узнать ID: добавьте бота в "
+            "группу и отправьте там команду /chatid",
             file=sys.stderr,
         )
 
@@ -172,11 +187,19 @@ SERVICE_DURATIONS = {
 # под конкретный заход, между заходами нужен перерыв на уборку.
 # Конец сеанса не задаётся здесь, а считается из SERVICE_DURATIONS, чтобы кнопка
 # показывала ровно ту длительность, которая уйдёт в запись.
-#   Берёзовая (3 ч): 10:00-13:00, 14:00-17:00, 18:00-21:00
-#   Хвойная  (4 ч): 10:00-14:00, 16:00-20:00
+# В берёзовой по будням утреннего захода нет — только дневной и вечерний.
+#   Берёзовая (3 ч): будни 14:00-17:00, 18:00-21:00
+#                    выходные 10:00-13:00, 14:00-17:00, 18:00-21:00
+#   Хвойная  (4 ч): 10:00-14:00, 16:00-20:00 — одинаково всю неделю
 SEANCE_STARTS = {
-    "birch": ["10:00", "14:00", "18:00"],
-    "pine": ["10:00", "16:00"],
+    "birch": {
+        "weekday": ["14:00", "18:00"],
+        "weekend": ["10:00", "14:00", "18:00"],
+    },
+    "pine": {
+        "weekday": ["10:00", "16:00"],
+        "weekend": ["10:00", "16:00"],
+    },
 }
 
 # На сколько дней вперёд предлагать даты и по сколько кнопок ставить в ряд.
@@ -266,6 +289,14 @@ def get_seance_length(bath_id: str, day_type: str, with_proc: bool) -> int:
     seconds = hours * 3600
     logger.info(f"Длительность сеанса: {hours} ч ({seconds} сек)")
     return seconds
+
+
+def seance_end(start: str, bath_id: str, day_type: str, with_proc: bool) -> str:
+    """Считает конец сеанса из длительности услуги: "14:00" -> "17:00".
+    Отдельной таблицы с концами заходов нет намеренно — иначе она разъедется
+    с SERVICE_DURATIONS, и клиент увидит одно, а в журнал уйдёт другое."""
+    hours = get_seance_length(bath_id, day_type, with_proc) // 3600
+    return (datetime.strptime(start, "%H:%M") + timedelta(hours=hours)).strftime("%H:%M")
 
 
 def _phone_digits(phone: str) -> str:
@@ -456,6 +487,49 @@ async def create_booking(yclients_id: int, staff_id: int, service_id: int, datet
     except Exception as e:
         logger.error(f"Exception создания записи: {e}")
         return False
+
+
+async def notify_group_about_booking(context: ContextTypes.DEFAULT_TYPE, user, details: dict) -> None:
+    """
+    Присылает в рабочую группу карточку новой брони.
+
+    Ошибки отправки только логируются: для клиента бронь уже создана, и падать
+    из-за того, что бота выкинули из группы, бот не должен.
+
+    Args:
+        user: telegram-пользователь, оформивший бронь
+        details: поля брони для карточки (см. вызов в book_time)
+    """
+    if not BOOKING_GROUP_CHAT_ID:
+        logger.info("BOOKING_GROUP_CHAT_ID не задан — уведомление в группу не отправляем")
+        return
+
+    # Имя и телефон приходят от пользователя, в HTML их нужно экранировать.
+    # mention_html() экранирует себя сам.
+    account = user.mention_html()
+    if user.username:
+        account += f" (@{user.username})"
+
+    text = (
+        "🆕 <b>Новая бронь</b>\n\n"
+        f"👤 {html.escape(details['name'])}\n"
+        f"📱 {html.escape(details['phone'])}\n"
+        f"✈️ {account}\n"
+        f"🆔 <code>{user.id}</code>\n\n"
+        f"🌿 Баня: {details['bath']}\n"
+        f"📅 Дата: {details['date']} ({details['day_text']})\n"
+        f"⏰ Сеанс: {details['start']} – {details['end']}\n"
+        f"💆 Процедуры: {details['proc_text']}\n"
+        f"👥 Гостей: {details['guests']}"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=BOOKING_GROUP_CHAT_ID, text=text, parse_mode="HTML"
+        )
+        logger.info(f"Уведомление о брони отправлено в группу {BOOKING_GROUP_CHAT_ID}")
+    except Exception as e:
+        logger.error(f"Не удалось отправить уведомление в группу {BOOKING_GROUP_CHAT_ID}: {e}")
 
 
 def clear_booking_data(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -867,16 +941,16 @@ def build_time_buttons(bath_id: str, day_type: str, with_proc: bool, slots: list
         list: ряды кнопок вида "10:00 – 13:00" (без "Назад"/"Отмена")
     """
     free = {slot.get('time') for slot in slots}
-    hours = get_seance_length(bath_id, day_type, with_proc) // 3600
+    starts = SEANCE_STARTS[bath_id][day_type]
 
     buttons = []
-    for start in SEANCE_STARTS[bath_id]:
+    for start in starts:
         if start not in free:
             continue
-        end = (datetime.strptime(start, "%H:%M") + timedelta(hours=hours)).strftime("%H:%M")
+        end = seance_end(start, bath_id, day_type, with_proc)
         buttons.append([InlineKeyboardButton(f"{start} – {end}", callback_data=f"time_{start}")])
 
-    logger.info(f"Свободных сеансов для {bath_id}: {len(buttons)} из {len(SEANCE_STARTS[bath_id])}")
+    logger.info(f"Свободных сеансов для {bath_id}/{day_type}: {len(buttons)} из {len(starts)}")
     return buttons
 
 
@@ -1042,16 +1116,34 @@ async def book_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         seance_length=seance_length
     )
 
+    end_str = seance_end(time_str, context.user_data['bath_id'], context.user_data['day_type'],
+                         context.user_data['with_procedures'])
+
     if success:
         logger.info(f"Бронирование успешно создано для пользователя {update.effective_user.id}")
+        await notify_group_about_booking(
+            context,
+            update.effective_user,
+            {
+                "name": context.user_data.get('name', '—'),
+                "phone": context.user_data.get('phone', '—'),
+                "bath": bath['name'],
+                "date": date_iso,
+                "day_text": day_text,
+                "start": time_str,
+                "end": end_str,
+                "proc_text": proc_text,
+                "guests": guest_count,
+            },
+        )
         await query.edit_message_text(
-            f"Готово! Вы забронированы ✅\n\n"
+            f"Готово! Баня забронирована ✅\n\n"
             f"🌿 Баня: {bath['name']}\n"
             f"📅 Дни: {day_text}\n"
             f"💆 Процедуры: {proc_text}\n"
             f"👥 Гостей: {guest_count}\n"
             f"📅 Дата: {date_iso}\n"
-            f"⏰ Время: {time_str}\n"
+            f"⏰ Сеанс: {time_str} – {end_str}\n"
             f"⏳ Длительность: {seance_length // 3600} ч\n\n"
             f"Нужно больше времени? Напишите или позвоните менеджеру:\n"
             f"👤 {MANAGER_NAME}\n"
@@ -1155,6 +1247,24 @@ async def go_book_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await force_book(update, context)  # внутри поднимает ApplicationHandlerStop
 
 
+async def chat_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Служебная команда: показывает ID текущего чата.
+
+    Нужна ровно один раз — чтобы узнать ID рабочей группы и прописать его
+    в BOOKING_GROUP_CHAT_ID. Отправьте /chatid в самой группе.
+    """
+    chat = update.effective_chat
+    logger.info(f"Запрошен ID чата: {chat.id} ({chat.type})")
+    await update.effective_message.reply_text(
+        f"ID этого чата: {chat.id}\n"
+        f"Тип: {chat.type}\n\n"
+        f"Впишите это число в переменную BOOKING_GROUP_CHAT_ID и перезапустите бота — "
+        f"сюда начнут приходить уведомления о новых бронях."
+    )
+    # Иначе команду подхватит fallback активного диалога и ответит «не понял»
+    raise ApplicationHandlerStop
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /help"""
     await update.message.reply_text(
@@ -1246,6 +1356,9 @@ def main() -> None:
     # безусловно, как сами команды.
     application.add_handler(CallbackQueryHandler(go_start_callback, pattern="^go_start$"), group=0)
     application.add_handler(CallbackQueryHandler(go_book_callback, pattern="^go_book$"), group=0)
+
+    # Служебная команда для настройки уведомлений — работает в любом чате
+    application.add_handler(CommandHandler("chatid", chat_id_command), group=0)
 
     application.add_handler(reg_handler, group=1)
     application.add_handler(book_handler, group=1)
