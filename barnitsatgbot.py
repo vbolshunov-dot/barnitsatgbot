@@ -78,6 +78,10 @@ SERVICES_CACHE_MINUTES = 10
 # нет — шаг молча пропускается.
 MENU_PHOTOS_DIR = Path(__file__).with_name("menu")
 
+# Папка с листами прайса. Уходят по команде /price первым альбомом, следом за
+# ними — фото банного меню. Порядок внутри папки — по имени файла.
+PRICE_PHOTOS_DIR = Path(__file__).with_name("price")
+
 # Файл для сохранения состояния диалогов между перезапусками бота
 PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "bot_persistence.pickle")
 
@@ -1242,41 +1246,63 @@ async def contact_manager_callback(update: Update, context: ContextTypes.DEFAULT
         return ConversationHandler.END
 
 
-async def send_menu_photos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def _photo_files(*dirs: Path) -> list:
+    """Собирает фотографии из папок: сначала первая папка целиком, потом вторая,
+    внутри каждой — по имени файла. Отсутствующие папки просто пропускаются."""
+    files = []
+    for directory in dirs:
+        if directory.is_dir():
+            files += sorted(
+                path for path in directory.glob("*")
+                if path.suffix.lower() in (".jpg", ".jpeg", ".png")
+            )
+    return files
+
+
+async def send_photo_album(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           dirs: list, cache_key: str, caption: str) -> None:
     """
-    Отправляет альбом с фотографиями банного меню.
+    Отправляет альбом фотографий из указанных папок.
 
     Первый раз файлы уходят с диска, дальше — по file_id, который Telegram
     выдал на загрузку: так альбом не перезаливается каждому гостю заново.
     file_id живут в bot_data и переживают перезапуск вместе с персистентностью.
 
-    Ошибки только логируются: не отправились фото — бронь всё равно продолжится.
+    Ошибки только логируются: не отправились фото — разговор всё равно продолжится.
+
+    Args:
+        dirs: папки с фото, в том порядке, в каком они должны идти в альбоме
+        cache_key: под каким ключом в bot_data держать file_id этого альбома
+        caption: подпись — Telegram показывает её у первой фотографии
     """
-    cached = context.bot_data.get("menu_file_ids")
+    cached = context.bot_data.get(cache_key)
 
     try:
         if cached:
             media = [InputMediaPhoto(file_id) for file_id in cached]
         else:
-            files = sorted(
-                path for path in MENU_PHOTOS_DIR.glob("*")
-                if path.suffix.lower() in (".jpg", ".jpeg", ".png")
-            ) if MENU_PHOTOS_DIR.is_dir() else []
+            files = _photo_files(*dirs)
             if not files:
-                logger.info(f"Фото меню не найдены в {MENU_PHOTOS_DIR}, пропускаем")
+                logger.info(f"Фото не найдены в {', '.join(str(d) for d in dirs)}, пропускаем")
                 return
+            # Telegram не берёт в один альбом больше десяти фотографий
             media = [InputMediaPhoto(path.read_bytes()) for path in files[:10]]
 
-        media[0] = InputMediaPhoto(media[0].media, caption="🧖 Банное меню")
+        media[0] = InputMediaPhoto(media[0].media, caption=caption)
         messages = await update.effective_message.reply_media_group(media=media)
 
         if not cached:
-            context.bot_data["menu_file_ids"] = [m.photo[-1].file_id for m in messages]
-            logger.info(f"Фото меню загружены и закэшированы: {len(messages)} шт.")
+            context.bot_data[cache_key] = [m.photo[-1].file_id for m in messages]
+            logger.info(f"Альбом «{caption}» загружен и закэширован: {len(messages)} шт.")
     except Exception as e:
         # Битый file_id после смены бота — сбрасываем кэш, в следующий раз зальём заново
-        context.bot_data.pop("menu_file_ids", None)
-        logger.error(f"Не удалось отправить фото меню: {e}")
+        context.bot_data.pop(cache_key, None)
+        logger.error(f"Не удалось отправить альбом «{caption}»: {e}")
+
+
+async def send_menu_photos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Альбом с фотографиями банного меню — уходит перед выбором процедур."""
+    await send_photo_album(update, context, [MENU_PHOTOS_DIR], "menu_file_ids", "🧖 Банное меню")
 
 
 def procedures_screen(procedures: list, chosen: list, needed: int, header: str) -> tuple:
@@ -1786,6 +1812,24 @@ async def chat_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     raise ApplicationHandlerStop
 
 
+async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/price — прайс-лист альбомом: сначала аренда бань, следом банное меню.
+
+    Работает в любой момент, в том числе посреди брони: показать цены и вернуться
+    к выбору — обычное дело, сбивать из-за этого диалог незачем.
+    """
+    logger.info(f"Пользователь {update.effective_user.id} запросил прайс-лист")
+    await send_photo_album(
+        update, context, [PRICE_PHOTOS_DIR, MENU_PHOTOS_DIR], "price_file_ids", "💰 Прайс-лист"
+    )
+    await update.effective_message.reply_text(
+        "Остались вопросы или готовы бронировать?",
+        reply_markup=InlineKeyboardMarkup([[book_button()], [manager_button()]]),
+    )
+    # Иначе команду подхватит fallback активного диалога и ответит «не понял»
+    raise ApplicationHandlerStop
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Обработчик команды /help"""
     await update.message.reply_text(
@@ -1824,6 +1868,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 BOT_COMMANDS = [
     BotCommand("start", "Меню бота и регистрация"),
     BotCommand("book", "Забронировать баню"),
+    BotCommand("price", "Прайс-лист"),
     BotCommand("help", "Помощь и контакты"),
     BotCommand("cancel", "Отменить текущее действие"),
 ]
@@ -1902,6 +1947,10 @@ def main() -> None:
     # безусловно, как сами команды.
     application.add_handler(CallbackQueryHandler(go_start_callback, pattern="^go_start$"), group=0)
     application.add_handler(CallbackQueryHandler(go_book_callback, pattern="^go_book$"), group=0)
+
+    # Прайс-лист — тоже в group=0: цены можно спросить и посреди бронирования,
+    # диалог при этом должен остаться там же, где был.
+    application.add_handler(CommandHandler("price", price_command), group=0)
 
     # Служебная команда для настройки уведомлений — работает в любом чате
     application.add_handler(CommandHandler("chatid", chat_id_command), group=0)
