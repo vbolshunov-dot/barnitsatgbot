@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sys
+import asyncio
 import traceback
 import httpx
 from collections import Counter
@@ -80,6 +81,10 @@ ERROR_NOTIFY_INTERVAL_MINUTES = 5
 # только те её услуги, у которых включена онлайн-запись, — так список правится
 # в кабинете, а не в коде: снял галку, и процедура пропала из бота.
 PROCEDURES_CATEGORY_ID = int(os.getenv("PROCEDURES_CATEGORY_ID", "26014494"))
+# Сколько ждём ответа YCLIENTS. Больше семи секунд ждать нет смысла: гость
+# всё это время смотрит на «⏳», а запросов за одну бронь несколько подряд.
+REQUEST_TIMEOUT = 7.0
+
 # Насколько доверяем закэшированному прайсу. Цены меняются редко, а дёргать
 # API на каждом шаге брони незачем.
 SERVICES_CACHE_MINUTES = 10
@@ -169,6 +174,34 @@ def check_config() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+# Один HTTP-клиент на весь бот. Раньше клиент создавался под каждый запрос, и
+# каждый раз заново шло TLS-рукопожатие с api.yclients.com — по 200-400 мс на
+# ровном месте, а за одну бронь запросов пять-шесть. Общий клиент держит
+# соединение открытым и переиспользует его.
+HTTP: dict = {"client": None}
+
+
+def http_client() -> httpx.AsyncClient:
+    """Отдаёт общий HTTP-клиент, при необходимости создавая его.
+
+    Создаётся лениво, а не на старте, чтобы отдельные скрипты рядом с ботом
+    могли импортировать эти функции, не поднимая всё приложение целиком.
+    """
+    client = HTTP.get("client")
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
+        HTTP["client"] = client
+    return client
+
+
+async def close_http_client() -> None:
+    """Закрывает общий клиент при остановке бота, чтобы не оставлять соединения."""
+    client = HTTP.get("client")
+    if client is not None and not client.is_closed:
+        await client.aclose()
+        logger.info("HTTP-клиент закрыт")
 
 
 def yclients_auth_header() -> str:
@@ -395,12 +428,12 @@ async def get_services_index() -> dict:
     headers = {"Authorization": yclients_auth_header(), "Accept": "application/vnd.yclients.v2+json"}
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, timeout=10.0)
-            if response.status_code != 200:
-                logger.error(f"services вернул {response.status_code}: {response.text}")
-                return SERVICES_CACHE["index"]
-            services = response.json().get('data') or []
+        client = http_client()
+        response = await client.get(url, headers=headers)
+        if response.status_code != 200:
+            logger.error(f"services вернул {response.status_code}: {response.text}")
+            return SERVICES_CACHE["index"]
+        services = response.json().get('data') or []
     except Exception as e:
         logger.error(f"Ошибка получения услуг: {e}")
         # Отдаём то, что было: устаревшая цена лучше, чем сорванная бронь
@@ -499,7 +532,7 @@ async def find_client_by_phone(client: httpx.AsyncClient, phone: str, headers: d
         "page_size": 10,
     }
     try:
-        resp = await client.post(search_url, json=payload, headers=headers, timeout=10.0)
+        resp = await client.post(search_url, json=payload, headers=headers)
         if resp.status_code == 200:
             for item in resp.json().get("data") or []:
                 if _phone_digits(item.get("phone", "")) == digits:
@@ -514,7 +547,7 @@ async def find_client_by_phone(client: httpx.AsyncClient, phone: str, headers: d
     # Запасной способ — старый GET-фильтр по списку клиентов.
     list_url = f"https://api.yclients.com/api/v1/clients/{YCLIENTS_COMPANY_ID}"
     try:
-        resp = await client.get(list_url, headers=headers, params={"phone": digits}, timeout=10.0)
+        resp = await client.get(list_url, headers=headers, params={"phone": digits})
         if resp.status_code == 200:
             for item in resp.json().get("data") or []:
                 if _phone_digits(item.get("phone", "")) == digits:
@@ -552,32 +585,32 @@ async def register_in_yclients(name: str, phone: str, telegram_id: int) -> tuple
     payload = {"name": name, "phone": phone, "comment": f"Telegram ID: {telegram_id}"}
 
     try:
-        async with httpx.AsyncClient() as client:
-            existing_id = await find_client_by_phone(client, phone, headers)
-            if existing_id:
-                logger.info(f"Клиент {phone} уже есть в базе, используем id={existing_id}")
-                return True, existing_id
+        client = http_client()
+        existing_id = await find_client_by_phone(client, phone, headers)
+        if existing_id:
+            logger.info(f"Клиент {phone} уже есть в базе, используем id={existing_id}")
+            return True, existing_id
 
-            logger.info(f"Отправляем запрос регистрации в YCLIENTS: {name}, {phone}")
-            response = await client.post(url, json=payload, headers=headers, timeout=10.0)
+        logger.info(f"Отправляем запрос регистрации в YCLIENTS: {name}, {phone}")
+        response = await client.post(url, json=payload, headers=headers)
 
-            if response.status_code in (200, 201):
-                data = response.json()
-                client_id = (data.get('data') or {}).get('id')
-                if client_id:
-                    logger.info(f"Клиент успешно зарегистрирован в YCLIENTS: id={client_id}")
-                    return True, int(client_id)
+        if response.status_code in (200, 201):
+            data = response.json()
+            client_id = (data.get('data') or {}).get('id')
+            if client_id:
+                logger.info(f"Клиент успешно зарегистрирован в YCLIENTS: id={client_id}")
+                return True, int(client_id)
 
-            # Создать не вышло. Частый случай — клиент всё-таки есть в базе,
-            # но поиск его не увидел (другой формат номера, права токена).
-            # Пробуем найти ещё раз, прежде чем сдаваться.
-            logger.error(f"Yclients register error: {response.status_code} {response.text}")
-            existing_id = await find_client_by_phone(client, phone, headers)
-            if existing_id:
-                logger.info(f"Клиент найден после неудачного создания: id={existing_id}")
-                return True, existing_id
+        # Создать не вышло. Частый случай — клиент всё-таки есть в базе,
+        # но поиск его не увидел (другой формат номера, права токена).
+        # Пробуем найти ещё раз, прежде чем сдаваться.
+        logger.error(f"Yclients register error: {response.status_code} {response.text}")
+        existing_id = await find_client_by_phone(client, phone, headers)
+        if existing_id:
+            logger.info(f"Клиент найден после неудачного создания: id={existing_id}")
+            return True, existing_id
 
-            return False, 0
+        return False, 0
     except Exception as e:
         logger.error(f"Yclients exception: {e}")
         return False, 0
@@ -602,12 +635,12 @@ async def get_working_intervals(staff_id: int, date: str) -> list:
     headers = {"Authorization": yclients_auth_header(), "Accept": "application/vnd.yclients.v2+json"}
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, timeout=10.0)
-            if response.status_code != 200:
-                logger.error(f"schedule вернул {response.status_code}: {response.text}")
-                return []
-            days = response.json().get('data') or []
+        client = http_client()
+        response = await client.get(url, headers=headers)
+        if response.status_code != 200:
+            logger.error(f"schedule вернул {response.status_code}: {response.text}")
+            return []
+        days = response.json().get('data') or []
     except Exception as e:
         logger.error(f"Ошибка получения графика: {e}")
         return []
@@ -639,12 +672,12 @@ async def get_busy_intervals(staff_id: int, date: str) -> list:
     params = {"staff_id": staff_id, "start_date": date, "end_date": date, "count": 200}
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, headers=headers, params=params, timeout=10.0)
-            if response.status_code != 200:
-                logger.error(f"records вернул {response.status_code}: {response.text}")
-                return False, []
-            records = response.json().get('data') or []
+        client = http_client()
+        response = await client.get(url, headers=headers, params=params)
+        if response.status_code != 200:
+            logger.error(f"records вернул {response.status_code}: {response.text}")
+            return False, []
+        records = response.json().get('data') or []
     except Exception as e:
         logger.error(f"Ошибка получения записей: {e}")
         return False, []
@@ -676,12 +709,16 @@ async def get_free_seances(bath_id: str, day_type: str, with_proc: bool, date: s
     staff_id = int(BATHS[bath_id]['staff_id'])
     hours = get_seance_length(bath_id, day_type, with_proc) // 3600
 
-    working = await get_working_intervals(staff_id, date)
+    # График и журнал друг от друга не зависят — спрашиваем оба разом, а не по
+    # очереди: шаг «Ищу свободное время» становится вдвое короче. В нерабочий
+    # день уходит один лишний запрос, но это редкий случай и он того стоит.
+    working, (ok, busy) = await asyncio.gather(
+        get_working_intervals(staff_id, date),
+        get_busy_intervals(staff_id, date),
+    )
     if not working:
         logger.info(f"Баня {bath_id} на {date} не работает или график не получен")
         return []
-
-    ok, busy = await get_busy_intervals(staff_id, date)
     if not ok:
         return []
 
@@ -734,15 +771,15 @@ async def create_booking(yclients_id: int, staff_id: int, services: list, dateti
     }
 
     try:
-        async with httpx.AsyncClient() as client:
-            logger.info(
-                f"Создаём запись в YCLIENTS: client_id={yclients_id}, услуги={services}, datetime={datetime_str}")
-            response = await client.post(url, json=payload, headers=headers, timeout=10.0)
-            if response.status_code == 201:
-                logger.info("Запись успешно создана в YCLIENTS")
-                return True
-            logger.error(f"Ошибка создания записи: {response.status_code} {response.text}")
-            return False
+        client = http_client()
+        logger.info(
+            f"Создаём запись в YCLIENTS: client_id={yclients_id}, услуги={services}, datetime={datetime_str}")
+        response = await client.post(url, json=payload, headers=headers)
+        if response.status_code == 201:
+            logger.info("Запись успешно создана в YCLIENTS")
+            return True
+        logger.error(f"Ошибка создания записи: {response.status_code} {response.text}")
+        return False
     except Exception as e:
         logger.error(f"Exception создания записи: {e}")
         return False
@@ -1697,7 +1734,12 @@ async def book_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             "procedures": procedures_text,
             "total": total,
         }
-        await notify_group_about_booking(context, update.effective_user, details)
+        # Уведомление админам уходит фоном: гость не должен ждать лишний
+        # round-trip к Telegram, чтобы увидеть «Готово». create_task от
+        # приложения, а не голый asyncio, — тогда PTB дождётся его при остановке.
+        context.application.create_task(
+            notify_group_about_booking(context, update.effective_user, details)
+        )
         # Ставим бронь в очередь автоматических писем: напоминание накануне
         # и просьба об отзыве наутро после визита.
         remember_booking(context, update.effective_chat.id, details)
@@ -1969,6 +2011,11 @@ async def post_init(application: Application) -> None:
     logger.info("Меню команд бота обновлено")
 
 
+async def post_shutdown(application: Application) -> None:
+    """Выполняется при остановке — закрывает общий HTTP-клиент."""
+    await close_http_client()
+
+
 def main() -> None:
     """запуск бота"""
     check_config()
@@ -1978,6 +2025,10 @@ def main() -> None:
         .token(BOT_TOKEN)
         .persistence(persistence)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        # Иначе гости обслуживаются строго по одному: пока один ждёт ответа
+        # YCLIENTS, у всех остальных кнопки висят. Вечером пятницы это заметно.
+        .concurrent_updates(True)
         .build()
     )
     #хендлер регистрации
