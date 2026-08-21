@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import sys
+import traceback
 import httpx
 from collections import Counter
 from datetime import date, datetime, time as dt_time, timedelta
@@ -64,6 +65,16 @@ MANAGER_TG_URL = os.getenv("MANAGER_TG_URL", "https://t.me/+79215530572")
 # отрицательный, вида -1001234567890 — минус обязателен.
 # Пусто — уведомления просто не отправляются, на бронирование это не влияет.
 BOOKING_GROUP_CHAT_ID = os.getenv("BOOKING_GROUP_CHAT_ID", "")
+
+# Личный чат администратора — туда падают технические ошибки бота. Именно в личку,
+# а не в рабочую группу: тексты с трассировкой сотрудникам ни к чему.
+# Узнаётся так же, командой /chatid, но отправленной боту в личном чате.
+# Пусто — ошибки останутся только в логе.
+ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "")
+# Одна и та же ошибка часто повторяется десятками — например, когда отвалился
+# YCLIENTS. Чтобы не завалить личку, повтор той же ошибки шлём не чаще чем раз
+# в столько минут.
+ERROR_NOTIFY_INTERVAL_MINUTES = 5
 
 # Категория YCLIENTS, из которой берутся процедуры банного меню. Предлагаются
 # только те её услуги, у которых включена онлайн-запись, — так список правится
@@ -139,6 +150,14 @@ def check_config() -> None:
             "ВНИМАНИЕ: не задан BOOKING_GROUP_CHAT_ID — уведомления о новых бронях "
             "в рабочую группу отправляться не будут. Узнать ID: добавьте бота в "
             "группу и отправьте там команду /chatid",
+            file=sys.stderr,
+        )
+
+    if not ADMIN_CHAT_ID:
+        print(
+            "ВНИМАНИЕ: не задан ADMIN_CHAT_ID — ошибки бота будут писаться только "
+            "в лог, в личку они не придут. Узнать ID: отправьте боту /chatid "
+            "в личном чате.",
             file=sys.stderr,
         )
 
@@ -1855,12 +1874,82 @@ async def invalid_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         )
 
 
+# Когда какая ошибка последний раз улетала админу: {текст ошибки: время}.
+# Обычная переменная модуля, а не bot_data: пиклить это незачем, после
+# перезапуска логично сообщить о проблеме заново.
+ERRORS_SENT: dict = {}
+
+
+def _should_notify(error_key: str) -> bool:
+    """Не даёт слать одну и ту же ошибку чаще, чем раз в ERROR_NOTIFY_INTERVAL_MINUTES."""
+    now = datetime.now()
+    last = ERRORS_SENT.get(error_key)
+    if last and (now - last) < timedelta(minutes=ERROR_NOTIFY_INTERVAL_MINUTES):
+        return False
+    # Словарь не должен расти бесконечно на потоке разных ошибок
+    if len(ERRORS_SENT) > 100:
+        ERRORS_SENT.clear()
+    ERRORS_SENT[error_key] = now
+    return True
+
+
+def _error_context(update: object) -> str:
+    """Описывает, на чём споткнулся бот: кто и что нажал или написал."""
+    if not isinstance(update, Update):
+        return "Вне обработки сообщения"
+
+    lines = []
+    user = update.effective_user
+    if user:
+        who = f"{user.full_name} (id {user.id}"
+        who += f", @{user.username})" if user.username else ")"
+        lines.append(f"Гость: {who}")
+    if update.callback_query:
+        lines.append(f"Нажал кнопку: {update.callback_query.data}")
+    elif update.effective_message and update.effective_message.text:
+        lines.append(f"Написал: {update.effective_message.text[:200]}")
+    return "\n".join(lines) or "Обновление без пользователя"
+
+
+async def notify_admin_about_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Присылает администратору в личку карточку ошибки с концом трассировки.
+
+    Сама ничего не поднимает наверх: если уж и уведомление не отправилось,
+    то падать в обработчике ошибок — последнее, что боту стоит делать.
+    """
+    if not ADMIN_CHAT_ID:
+        return
+
+    error = context.error
+    error_key = f"{type(error).__name__}: {error}"
+    if not _should_notify(error_key):
+        logger.info("Такая ошибка уже отправлена недавно, админу не дублируем")
+        return
+
+    tb = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    text = (
+        f"\u26A0\uFE0F Ошибка в боте\n\n"
+        f"{error_key}\n\n"
+        f"{_error_context(update)}\n\n"
+        f"Где именно (конец трассировки):\n{tb[-1200:]}"
+    )
+
+    try:
+        # Без parse_mode: в трассировке хватает символов, на которых разметка ломается
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=text[:4096])
+        logger.info(f"Ошибка отправлена администратору в чат {ADMIN_CHAT_ID}")
+    except Exception as e:
+        logger.error(f"Не удалось отправить ошибку администратору: {e}")
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Глобальный обработчик ошибок — не даёт боту падать на некритичных ошибках Telegram API"""
     if isinstance(context.error, BadRequest) and "Message is not modified" in str(context.error):
         # Пользователь нажал ту же кнопку дважды подряд — просто игнорируем
         return
     logger.error(f"Необработанная ошибка: {context.error}", exc_info=context.error)
+    await notify_admin_about_error(update, context)
 
 
 # Меню команд — то, что Telegram показывает по кнопке «Menu» рядом с полем ввода.
