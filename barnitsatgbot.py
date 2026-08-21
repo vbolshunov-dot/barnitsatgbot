@@ -6,11 +6,13 @@ import re
 import sys
 import httpx
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from telegram import (
     Update,
+    BotCommand,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     InlineKeyboardButton,
@@ -78,6 +80,24 @@ MENU_PHOTOS_DIR = Path(__file__).with_name("menu")
 
 # Файл для сохранения состояния диалогов между перезапусками бота
 PERSISTENCE_FILE = os.getenv("PERSISTENCE_FILE", "bot_persistence.pickle")
+
+# Часовой пояс филиала. Все даты и время в боте — местные, а сервер вполне может
+# жить в UTC, поэтому расписание рассылок привязано к этой зоне явно.
+LOCAL_TZ = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
+
+# Когда уходят автоматические сообщения клиентам (по местному времени).
+# Напоминание — накануне визита, просьба об отзыве — на следующее утро после него.
+REMINDER_TIME = dt_time(12, 0)
+FEEDBACK_TIME = dt_time(10, 0)
+
+# Ключ в bot_data, под которым лежит список оформленных броней. Именно из него
+# ежедневные задания берут, кому сегодня писать. Хранится в bot_data (а значит,
+# переживает перезапуск через PicklePersistence), а не в виде отложенных job'ов:
+# job'ы PTB не сохраняются и после деплоя все напоминания были бы потеряны.
+BOOKINGS_KEY = "bookings"
+# Через сколько дней после визита бронь выбрасывается из этого списка.
+# Оба сообщения к тому моменту уже отправлены, держать дальше незачем.
+BOOKINGS_KEEP_DAYS = 7
 
 
 def check_config() -> None:
@@ -750,6 +770,125 @@ async def notify_group_about_booking(context: ContextTypes.DEFAULT_TYPE, user, d
         logger.error(f"Не удалось отправить уведомление в группу {BOOKING_GROUP_CHAT_ID}: {e}")
 
 
+def _today_local() -> date:
+    """Сегодняшняя дата по часовому поясу филиала, без времени.
+
+    Именно по поясу филиала, а не сервера: хостинг стоит в другой зоне и его
+    дата переключается в другой момент, чем в бане."""
+    return datetime.now(LOCAL_TZ).date()
+
+
+def booking_card(booking: dict) -> str:
+    """Карточка брони для писем клиенту: что, когда и на сколько человек."""
+    return (
+        f"\U0001F33F Баня: {booking['bath']}\n"
+        f"\U0001F4C5 Дата: {format_date_ru(booking['date'])}\n"
+        f"\u23F0 Сеанс: {booking['start']} – {booking['end']}\n"
+        f"\U0001F465 Гостей: {booking['guests']}\n"
+        f"\U0001F9D6 Банное меню: {booking['procedures']}"
+    )
+
+
+def remember_booking(context: ContextTypes.DEFAULT_TYPE, chat_id: int, details: dict) -> None:
+    """Запоминает бронь, чтобы накануне визита прислать напоминание, а наутро
+    после него — попросить об отзыве.
+
+    Args:
+        chat_id: личный чат клиента с ботом, туда уйдут оба сообщения
+        details: те же поля брони, что идут в карточку для группы
+    """
+    booking = {
+        "chat_id": chat_id,
+        "name": details.get("name", ""),
+        "bath": details["bath"],
+        "date": details["date"],
+        "start": details["start"],
+        "end": details["end"],
+        "guests": details["guests"],
+        "procedures": details.get("procedures", "нет"),
+        "reminded": False,
+        "feedback_sent": False,
+    }
+    context.bot_data.setdefault(BOOKINGS_KEY, []).append(booking)
+    logger.info(f"Бронь на {booking['date']} поставлена в очередь напоминаний (чат {chat_id})")
+
+
+def forget_old_bookings(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Выбрасывает брони, которые давно прошли, — список не должен расти вечно."""
+    bookings = context.bot_data.get(BOOKINGS_KEY)
+    if not bookings:
+        return
+    edge = (_today_local() - timedelta(days=BOOKINGS_KEEP_DAYS)).strftime("%Y-%m-%d")
+    kept = [b for b in bookings if b.get("date", "") >= edge]
+    if len(kept) != len(bookings):
+        logger.info(f"Из очереди напоминаний убрано старых броней: {len(bookings) - len(kept)}")
+        context.bot_data[BOOKINGS_KEY] = kept
+
+
+async def _send_to_client(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, markup) -> bool:
+    """Отправляет сообщение клиенту. Возвращает False, если не дошло.
+
+    Ошибку только логируем: клиент мог заблокировать бота, и падать из-за
+    одного такого рассылка не должна — остальным написать всё равно нужно.
+    """
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=markup)
+        return True
+    except Exception as e:
+        logger.error(f"Не удалось отправить сообщение клиенту {chat_id}: {e}")
+        return False
+
+
+async def send_day_before_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Напоминание накануне визита — всем, у кого баня забронирована на завтра.
+
+    Если бронь оформили в тот же день позже REMINDER_TIME, напоминание не уйдёт:
+    задание за сегодня уже отработало, а у клиента и так свежее подтверждение.
+    """
+    target = (_today_local() + timedelta(days=1)).strftime("%Y-%m-%d")
+    markup = InlineKeyboardMarkup([[manager_button("\U0001F4DE Связаться с менеджером")]])
+
+    for booking in context.bot_data.get(BOOKINGS_KEY, []):
+        if booking.get("reminded") or booking.get("date") != target:
+            continue
+        name = booking.get("name") or "друзья"
+        text = (
+            f"Доброго времени суток, {name}!\n\n"
+            f"На завтра у вас забронирована баня:\n"
+            f"{booking_card(booking)}\n\n"
+            f"Не забудьте взять с собой купальники и тапочки.\n"
+            f"До встречи в доме тепла и отдыха «Барница»!"
+        )
+        if await _send_to_client(context, booking["chat_id"], text, markup):
+            booking["reminded"] = True
+            logger.info(f"Напоминание о завтрашней бане отправлено в чат {booking['chat_id']}")
+
+    forget_old_bookings(context)
+
+
+async def send_feedback_requests(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Просьба об отзыве — наутро после визита."""
+    target = (_today_local() - timedelta(days=1)).strftime("%Y-%m-%d")
+    markup = InlineKeyboardMarkup([
+        [manager_button("\U0001F4AC Поделиться впечатлениями")],
+        [book_button("\U0001F33F Забронировать снова")],
+    ])
+
+    for booking in context.bot_data.get(BOOKINGS_KEY, []):
+        if booking.get("feedback_sent") or booking.get("date") != target:
+            continue
+        text = (
+            "Доброе утро! Надеемся, что вчера Вам удалось отдохнуть и восстановиться "
+            "в нашем банном дворе. Для нас очень важна обратная связь, поэтому просим "
+            "вас поделиться впечатлениями у нас в гостях. Благодарим Вас и ждём в гости снова!"
+        )
+        if await _send_to_client(context, booking["chat_id"], text, markup):
+            booking["feedback_sent"] = True
+            logger.info(f"Просьба об отзыве отправлена в чат {booking['chat_id']}")
+
+    forget_old_bookings(context)
+
+
 def clear_booking_data(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Удаляет временные данные бронирования, не трогая регистрацию."""
     for key in BOOKING_KEYS:
@@ -1207,7 +1346,7 @@ def build_date_buttons(day_type: str, days_ahead: int = DAYS_AHEAD) -> list:
     """
     buttons = []
     row = []
-    today = datetime.now()
+    today = _today_local()
     days_ru = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
 
     for i in range(1, days_ahead + 1):
@@ -1367,7 +1506,7 @@ async def book_date(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     # Кнопки строятся с завтрашнего дня, но сообщение могло провисеть до полуночи —
     # тогда вчерашняя кнопка «на завтра» указывает на сегодня. Ловим это здесь.
-    if date_obj.date() <= datetime.now().date():
+    if date_obj.date() <= _today_local():
         logger.info(f"Пользователь {update.effective_user.id} выбрал сегодняшнюю или прошедшую дату {date_iso}")
         await query.answer("На сегодня записаться уже нельзя — выберите другой день", show_alert=True)
         return BOOK_DATE
@@ -1501,22 +1640,22 @@ async def book_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if success:
         logger.info(f"Бронирование успешно создано для пользователя {update.effective_user.id}")
-        await notify_group_about_booking(
-            context,
-            update.effective_user,
-            {
-                "name": context.user_data.get('name', '—'),
-                "phone": context.user_data.get('phone', '—'),
-                "bath": bath['name'],
-                "date": date_iso,
-                "start": time_str,
-                "end": end_str,
-                "proc_text": proc_text,
-                "guests": guest_count,
-                "procedures": procedures_text,
-                "total": total,
-            },
-        )
+        details = {
+            "name": context.user_data.get('name', '—'),
+            "phone": context.user_data.get('phone', '—'),
+            "bath": bath['name'],
+            "date": date_iso,
+            "start": time_str,
+            "end": end_str,
+            "proc_text": proc_text,
+            "guests": guest_count,
+            "procedures": procedures_text,
+            "total": total,
+        }
+        await notify_group_about_booking(context, update.effective_user, details)
+        # Ставим бронь в очередь автоматических писем: напоминание накануне
+        # и просьба об отзыве наутро после визита.
+        remember_booking(context, update.effective_chat.id, details)
         await query.edit_message_text(
             f"Готово! Баня забронирована ✅\n\n"
             f"🌿 Баня: {bath['name']}\n"
@@ -1680,11 +1819,33 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error(f"Необработанная ошибка: {context.error}", exc_info=context.error)
 
 
+# Меню команд — то, что Telegram показывает по кнопке «Menu» рядом с полем ввода.
+# Служебную /chatid сюда не кладём: она нужна администратору один раз при настройке.
+BOT_COMMANDS = [
+    BotCommand("start", "Меню бота и регистрация"),
+    BotCommand("book", "Забронировать баню"),
+    BotCommand("help", "Помощь и контакты"),
+    BotCommand("cancel", "Отменить текущее действие"),
+]
+
+
+async def post_init(application: Application) -> None:
+    """Выполняется один раз при старте — прописывает меню команд в Telegram."""
+    await application.bot.set_my_commands(BOT_COMMANDS)
+    logger.info("Меню команд бота обновлено")
+
+
 def main() -> None:
     """запуск бота"""
     check_config()
     persistence = PicklePersistence(filepath=PERSISTENCE_FILE)
-    application = Application.builder().token(BOT_TOKEN).persistence(persistence).build()
+    application = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .persistence(persistence)
+        .post_init(post_init)
+        .build()
+    )
     #хендлер регистрации
     reg_handler = ConversationHandler(
         name="registration",
@@ -1749,6 +1910,34 @@ def main() -> None:
     application.add_handler(book_handler, group=1)
     application.add_handler(CommandHandler("help", help_command), group=1)
     application.add_error_handler(error_handler)
+
+    # Автоматические письма клиентам: напоминание накануне визита и просьба об
+    # отзыве наутро после него. По одному ежедневному заданию на каждое — так
+    # рассылка переживает перезапуск, в отличие от отложенных job'ов на бронь.
+    if application.job_queue:
+        application.job_queue.run_daily(
+            send_day_before_reminders,
+            time=REMINDER_TIME.replace(tzinfo=LOCAL_TZ),
+            name="day_before_reminders",
+        )
+        application.job_queue.run_daily(
+            send_feedback_requests,
+            time=FEEDBACK_TIME.replace(tzinfo=LOCAL_TZ),
+            name="feedback_requests",
+        )
+        # Если бота перезапустили уже после времени рассылки, сегодняшнее задание
+        # само отработает только завтра. Догоняем сразу после старта: повторов
+        # не будет, отправленное помечено флагами внутри самой брони.
+        now = datetime.now(LOCAL_TZ).time()
+        if now >= REMINDER_TIME:
+            application.job_queue.run_once(send_day_before_reminders, when=10, name="day_before_catchup")
+        if now >= FEEDBACK_TIME:
+            application.job_queue.run_once(send_feedback_requests, when=10, name="feedback_catchup")
+    else:
+        logger.error(
+            "JobQueue недоступна — напоминания и просьбы об отзыве отправляться НЕ будут. "
+            'Поставьте зависимость: pip install "python-telegram-bot[job-queue]"'
+        )
 
     logger.info("Бот запущен")
     application.run_polling(drop_pending_updates=True)
